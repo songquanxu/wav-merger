@@ -38,7 +38,7 @@ if ! command -v ffmpeg &> /dev/null; then
 fi
 
 # 设置虚拟环境
-ENV_PATH="$HOME/wav_merger_env"
+ENV_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/wav_merger_env"
 if [ ! -d "$ENV_PATH" ]; then
     echo "正在创建虚拟环境..."
     python3 -m venv "$ENV_PATH"
