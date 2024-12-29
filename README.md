@@ -127,7 +127,7 @@ ffmpeg -i output.wav -b:a 32k compressed_output.wav
 
 ## 开发说明
 
-本程序是基于 FFmpeg 开发的图形界面工具，在 Cursor AI 的辅助下完成开发。
+本程序是基于 FFmpeg 开发的图形界面工具，在 AI 的辅助下完成开发。
 
 ### 致谢
 
