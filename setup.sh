@@ -1,106 +1,111 @@
 #!/bin/bash
+set -euo pipefail
 
-echo "开始设置 WAV 文件合并工具环境..."
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENV_PATH="$SCRIPT_DIR/wav_merger_env"
+PYTHON_BIN=""
 
-# 检查是否已安装 Python 3
-if ! command -v python3 &> /dev/null; then
-    echo "未检测到 Python 3，请先安装 Python 3"
+echo "开始设置 DJI Mic 录音整理工具..."
+
+ensure_homebrew() {
+  if command -v brew >/dev/null 2>&1; then
+    return
+  fi
+
+  if [[ "$(uname)" != "Darwin" ]]; then
+    echo "未检测到 Homebrew。请先安装 Python 3 和 ffmpeg。"
     exit 1
-fi
+  fi
 
-# 检查并安装 Homebrew
-install_homebrew() {
-    if ! command -v brew &> /dev/null; then
-        echo "正在安装 Homebrew..."
-        # 首先尝试官方源
-        if ! /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"; then
-            echo "官方源安装失败，尝试使用国内镜像源..."
-            # 使用国内镜像源
-            /bin/zsh -c "$(curl -fsSL https://gitee.com/cunkai/HomebrewCN/raw/master/Homebrew.sh)"
-        fi
-        
-        # 配置 Homebrew 环境变量
-        echo 'eval "$(/opt/homebrew/bin/brew shellenv)"' >> ~/.zprofile
-        eval "$(/opt/homebrew/bin/brew shellenv)"
-        
-        # 等待 Homebrew 完全配置
-        sleep 2
-    fi
+  echo "未检测到 Homebrew，正在安装..."
+  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+
+  if [[ -x /opt/homebrew/bin/brew ]]; then
+    eval "$(/opt/homebrew/bin/brew shellenv)"
+  elif [[ -x /usr/local/bin/brew ]]; then
+    eval "$(/usr/local/bin/brew shellenv)"
+  fi
 }
 
-# 安装 Homebrew
-install_homebrew
+ensure_audio_backend() {
+  if "$ENV_PATH/bin/python" - <<'PY' >/dev/null 2>&1
+import imageio_ffmpeg
+imageio_ffmpeg.get_ffmpeg_exe()
+PY
+  then
+    return
+  fi
 
-# 检查并安装 ffmpeg
-if ! command -v ffmpeg &> /dev/null; then
+  if command -v ffmpeg >/dev/null 2>&1; then
+    return
+  fi
+
+  if [[ "$(uname)" == "Darwin" ]]; then
+    ensure_homebrew
     echo "正在安装 ffmpeg..."
     brew install ffmpeg
+  else
+    echo "未找到 ffmpeg。请用系统包管理器安装 ffmpeg。"
+    exit 1
+  fi
+}
+
+python_has_tk() {
+  "$1" - <<'PY' >/dev/null 2>&1
+import tkinter
+PY
+}
+
+select_python() {
+  if [[ "$(uname)" == "Darwin" ]] && command -v python3.11 >/dev/null 2>&1 && ! python_has_tk python3.11; then
+    ensure_homebrew
+    echo "检测到 Python 3.11 缺少 Tkinter，正在安装 python-tk@3.11..."
+    brew install python-tk@3.11
+  fi
+
+  local candidates=("python3.11" "python3.12" "python3.13" "python3")
+  for candidate in "${candidates[@]}"; do
+    if command -v "$candidate" >/dev/null 2>&1 && python_has_tk "$candidate"; then
+      PYTHON_BIN="$(command -v "$candidate")"
+      return
+    fi
+  done
+
+  echo "未找到可用的 Python/Tkinter。请安装 Python 3.11+ 和 Tkinter。"
+  exit 1
+}
+
+select_python
+
+echo "使用 Python: $PYTHON_BIN"
+
+if [[ -d "$ENV_PATH" ]]; then
+  if ! "$ENV_PATH/bin/python" - <<'PY' >/dev/null 2>&1
+import sys
+import tkinter
+if sys.version_info < (3, 10) or tkinter.TkVersion < 8.6:
+    raise SystemExit(1)
+PY
+  then
+    echo "现有虚拟环境不可用，正在重建..."
+    rm -rf "$ENV_PATH"
+  fi
 fi
 
-# 设置虚拟环境
-ENV_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/wav_merger_env"
-if [ ! -d "$ENV_PATH" ]; then
-    echo "正在创建虚拟环境..."
-    python3 -m venv "$ENV_PATH"
+if [[ ! -d "$ENV_PATH" ]]; then
+  echo "正在创建虚拟环境..."
+  "$PYTHON_BIN" -m venv "$ENV_PATH"
 fi
 
-# 激活虚拟环境并安装依赖
-echo "正在安装必要的 Python 包..."
-source "$ENV_PATH/bin/activate"
+if [[ -s "$SCRIPT_DIR/requirements.txt" ]]; then
+  echo "正在安装 Python 依赖..."
+  "$ENV_PATH/bin/python" -m pip install -r "$SCRIPT_DIR/requirements.txt"
+fi
 
-# 设置 pip 镜像源（如果需要）
-pip3 config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple
+ensure_audio_backend
 
-# 安装所需的 Python 包
-pip3 install pygame mutagen
+chmod +x "$SCRIPT_DIR/run_wav_merger.sh"
 
-# 创建启动脚本
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-RUN_SCRIPT="$SCRIPT_DIR/run_wav_merger.sh"
-
-cat > "$RUN_SCRIPT" << EOL
-#!/bin/bash
-source "$ENV_PATH/bin/activate"
-python3 "\$(dirname "\$0")/wav_merger.py"
-EOL
-
-# 添加执行权限
-chmod +x "$RUN_SCRIPT"
-
-# 创建一个简单的README
-cat > "$SCRIPT_DIR/README.md" << EOL
-# WAV文件合并工具
-
-这是一个用于合并WAV文件的图形界面工具。
-
-## 功能特点
-- 支持文件夹导入和单个文件添加
-- 支持音频预览和进度控制
-- 支持文件顺序调整
-- 支持批量文件管理
-
-## 使用方法
-1. 双击 \`run_wav_merger.sh\` 启动程序
-2. 或在终端中运行 \`./run_wav_merger.sh\`
-
-## 故障排除
-如果遇到权限问题，请运行：
-\`\`\`bash
-chmod +x run_wav_merger.sh
-\`\`\`
-
-如果遇到依赖问题，请运行：
-\`\`\`bash
-./setup.sh
-\`\`\`
-EOL
-
-echo "设置完成！"
-echo "你可以通过以下方式运行程序："
-echo "1. 双击 run_wav_merger.sh"
-echo "2. 在终端中运行 ./run_wav_merger.sh"
-echo ""
-echo "如果遇到问题："
-echo "1. 确保已经给脚本添加了执行权限：chmod +x run_wav_merger.sh"
-echo "2. 如果安装过程中断，可以重新运行 ./setup.sh"
-echo "3. 如果遇到网络问题，脚本会自动尝试使用国内镜像源" 
+echo "设置完成。运行："
+echo "  cd \"$SCRIPT_DIR\""
+echo "  ./run_wav_merger.sh"

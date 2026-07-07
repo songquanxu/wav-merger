@@ -6,6 +6,7 @@ __pycache__/
 .Python
 env/
 build/
+release/
 develop-eggs/
 dist/
 downloads/
@@ -18,6 +19,7 @@ sdist/
 var/
 wheels/
 *.egg-info/
+*.spec
 .installed.cfg
 *.egg
 .env

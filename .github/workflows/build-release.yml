@@ -1,0 +1,71 @@
+name: Build Release Apps
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            label: macOS
+            artifact: DJI-Mic-Organizer-macOS.zip
+          - os: windows-latest
+            label: Windows
+            artifact: DJI-Mic-Organizer-Windows.zip
+          - os: ubuntu-latest
+            label: Linux
+            artifact: DJI-Mic-Organizer-Linux.tar.gz
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt pyinstaller
+
+      - name: Build app
+        shell: bash
+        run: |
+          pyinstaller \
+            --noconfirm \
+            --clean \
+            --windowed \
+            --name "DJI Mic Organizer" \
+            --collect-binaries imageio_ffmpeg \
+            --collect-data imageio_ffmpeg \
+            --hidden-import send2trash \
+            wav_merger.py
+
+      - name: Package macOS
+        if: runner.os == 'macOS'
+        run: ditto -c -k --sequesterRsrc --keepParent "dist/DJI Mic Organizer.app" "${{ matrix.artifact }}"
+
+      - name: Package Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path "dist/DJI Mic Organizer" -DestinationPath "${{ matrix.artifact }}"
+
+      - name: Package Linux
+        if: runner.os == 'Linux'
+        run: tar -czf "${{ matrix.artifact }}" -C dist "DJI Mic Organizer"
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.artifact }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true

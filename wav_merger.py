@@ -1,698 +1,934 @@
 """
-WAV音频文件合并工具 (WAV Audio Merger)
-版本：1.0.0
-创建日期：2023.12.29
+DJI Mic recording organizer.
 
-版权声明：
-本程序在 AI 辅助下开发完成（基于 Cursor AI）。
-作者保留版权，但允许在以下条件下自由使用：
-1. 允许任何人以非盈利方式下载、使用、分发和修改本程序
-2. 必须保留此版权声明
-3. 修改后的版本必须明确声明已经过修改
-4. 不得用于商业目的
-
-使用的开源组件：
-- Python 3.13+ (https://www.python.org/)
-- tkinter - Python 标准 GUI 库
-- pygame 2.6.1+ (https://www.pygame.org/) - 用于音频播放
-- mutagen (https://mutagen.readthedocs.io/) - 用于音频元数据处理
-- FFmpeg (https://ffmpeg.org/) - 用于音频处理和合并
-
-依赖说明：
-1. 系统需求：
-   - 操作系统：Windows/macOS/Linux
-   - Python 3.13 或更高版本
-   - FFmpeg
-
-2. Python 包依赖：
-   - pygame>=2.6.1
-   - mutagen
-   
-项目主页：https://github.com/songquanxu/wav-merger
-问题反馈：https://github.com/songquanxu/wav-merger/issues
-
-更新历史：
-- 1.0.0 (2023.12.29): 首次发布
-  * 支持 WAV 文件合并
-  * 支持音频预览
-  * 支持导出为 MP3
-  * 文件属性查看
+This app scans WAV files, groups adjacent DJI Mic chunks into recording
+sessions, and exports each session as a compact audio file.
 """
+
+from __future__ import annotations
 
 import json
 import os
+import queue
+import re
+import shutil
 import subprocess
-import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
-import glob
-import time
-import pygame
-from mutagen.wave import WAVE  # 用于获取音频时长
 import tempfile
+import threading
+import wave
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from pathlib import Path
+from tkinter import filedialog, messagebox, ttk
+import tkinter as tk
 
-class WavMerger:
-    def __init__(self):
-        self.window = tk.Tk()
-        self.window.title("WAV文件合并工具")
-        self.window.geometry("1000x700")
-        
-        # 加载配置
-        self.config_file = os.path.join(os.path.expanduser("~"), ".wav_merger_config.json")
-        self.load_config()
-        
-        # 初始化pygame音频系统
-        pygame.mixer.init()
-        
-        # 音频播放状态
-        self.is_playing = False
-        self.current_audio_length = 0
-        self.current_audio_path = None
-        self.is_dragging = False  # 添加拖动状态标记
-        
-        # 添加播放位置跟踪
-        self.current_position = 0
-        self.start_offset = 0
-        
-        # 创建界面元素
-        self.create_widgets()
-        
-        # 初始化按钮状态
+try:
+    from send2trash import send2trash
+except ImportError:  # setup installs it for normal use.
+    send2trash = None
+
+
+APP_TITLE = "DJI Mic 录音整理工具"
+CONFIG_PATH = Path.home() / ".wav_merger_config.json"
+SUPPORTED_EXTENSIONS = {".wav", ".wave"}
+
+
+FORMAT_PRESETS = {
+    "m4a": {
+        "label": "M4A / AAC（推荐）",
+        "extension": ".m4a",
+        "codec_args": ["-c:a", "aac"],
+        "bitrates": ["48", "64", "96", "128"],
+        "default_bitrate": "64",
+    },
+    "mp3": {
+        "label": "MP3（兼容优先）",
+        "extension": ".mp3",
+        "codec_args": ["-c:a", "libmp3lame"],
+        "bitrates": ["64", "96", "128", "192"],
+        "default_bitrate": "96",
+    },
+    "wav": {
+        "label": "WAV（无压缩）",
+        "extension": ".wav",
+        "codec_args": ["-c:a", "pcm_s16le"],
+        "bitrates": [],
+        "default_bitrate": "",
+    },
+}
+
+
+@dataclass
+class AudioFile:
+    path: Path
+    duration: float
+    size: int
+    start_time: datetime
+
+    @property
+    def end_time(self) -> datetime:
+        return self.start_time + timedelta(seconds=self.duration)
+
+    @property
+    def display_name(self) -> str:
+        return self.path.name
+
+
+@dataclass
+class RecordingGroup:
+    files: list[AudioFile] = field(default_factory=list)
+    title: str = ""
+
+    @property
+    def start_time(self) -> datetime | None:
+        return self.files[0].start_time if self.files else None
+
+    @property
+    def end_time(self) -> datetime | None:
+        return self.files[-1].end_time if self.files else None
+
+    @property
+    def duration(self) -> float:
+        return sum(item.duration for item in self.files)
+
+    @property
+    def size(self) -> int:
+        return sum(item.size for item in self.files)
+
+
+class WavMergerApp:
+    def __init__(self) -> None:
+        self.root = tk.Tk()
+        self.root.title(APP_TITLE)
+        self.root.geometry("1180x760")
+        self.root.minsize(980, 640)
+
+        self.config = self.load_config()
+        self.ffmpeg = self.locate_ffmpeg()
+
+        self.audio_files: list[AudioFile] = []
+        self.groups: list[RecordingGroup] = []
+        self.selected_folder = tk.StringVar(value=self.config.get("last_folder", ""))
+        self.output_folder = tk.StringVar(value=self.config.get("output_folder", ""))
+        self.threshold_minutes = tk.StringVar(value=str(self.config.get("threshold_minutes", 2)))
+        self.format_choice = tk.StringVar(value=self.normalize_format_key(self.config.get("format", "m4a")))
+        self.format_label = tk.StringVar()
+        self.bitrate = tk.StringVar(value=self.config.get("bitrate", "64"))
+        self.mix_to_mono = tk.BooleanVar(value=self.config.get("mix_to_mono", True))
+        self.recursive_scan = tk.BooleanVar(value=self.config.get("recursive_scan", True))
+        self.export_selected_only = tk.BooleanVar(value=False)
+        self.delete_sources_after_export = tk.BooleanVar(value=self.config.get("delete_sources_after_export", False))
+        self.status_text = tk.StringVar(value="请选择 DJI Mic 录音文件夹。")
+        self.progress_text = tk.StringVar(value="")
+        self.progress_value = tk.DoubleVar(value=0)
+        self.work_queue: queue.Queue[tuple[str, object]] = queue.Queue()
+        self.is_exporting = False
+        self.current_process: subprocess.Popen[str] | None = None
+
+        self.build_ui()
+        self.update_format_controls()
         self.update_button_states()
-        
-        # 绑定窗口关闭事件
-        self.window.protocol("WM_DELETE_WINDOW", self.on_closing)
-        
-        # 创建定时器用于更新进度条
-        self.update_progress()
-        
-        # 显示初始使用说明
-        self.show_usage_guide()
-        
-    def load_config(self):
-        """加载配置文件"""
-        self.config = {}
-        if os.path.exists(self.config_file):
-            try:
-                with open(self.config_file, 'r') as f:
-                    self.config = json.load(f)
-            except:
-                pass
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.root.after(120, self.drain_work_queue)
 
-    def save_config(self):
-        """保存配置文件"""
+        if not self.ffmpeg:
+            self.status_text.set("未找到 ffmpeg。请先运行 setup.sh，或用 Homebrew 安装 ffmpeg。")
+
+    def load_config(self) -> dict:
+        if not CONFIG_PATH.exists():
+            return {}
         try:
-            with open(self.config_file, 'w') as f:
-                json.dump(self.config, f)
-        except:
+            return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    def save_config(self) -> None:
+        data = {
+            "last_folder": self.selected_folder.get(),
+            "output_folder": self.output_folder.get(),
+            "threshold_minutes": self.get_threshold_minutes(),
+            "format": self.format_choice.get(),
+            "bitrate": self.bitrate.get(),
+            "mix_to_mono": self.mix_to_mono.get(),
+            "recursive_scan": self.recursive_scan.get(),
+            "delete_sources_after_export": self.delete_sources_after_export.get(),
+        }
+        try:
+            CONFIG_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError:
             pass
 
-    def create_widgets(self):
-        # 主框架
-        main_frame = ttk.Frame(self.window)
-        main_frame.pack(padx=10, pady=10, fill=tk.BOTH, expand=True)
-        
-        # 创建左右分隔的面板
-        paned = ttk.PanedWindow(main_frame, orient=tk.HORIZONTAL)
-        paned.pack(fill=tk.BOTH, expand=True)
-        
-        # 左侧面板
-        left_frame = ttk.Frame(paned)
-        paned.add(left_frame, weight=3)  # 左侧占比更大
-        
-        # 右侧属性面板
-        right_frame = ttk.Frame(paned)
-        paned.add(right_frame, weight=1)  # 右侧占比更小
-        
-        # === 左侧面板内容 ===
-        # 顶部按钮框架
-        top_button_frame = ttk.Frame(left_frame)
-        top_button_frame.pack(fill=tk.X, pady=5)
-        
-        # 移除选择文件夹按钮，只保留添加文件按钮
-        self.add_btn = ttk.Button(top_button_frame, text="添加WAV文件", command=self.add_files)
-        self.add_btn.pack(side=tk.LEFT, padx=5)
-        
-        # 移除选中按钮
-        self.remove_btn = ttk.Button(top_button_frame, text="移除选中", command=self.remove_selected)
-        self.remove_btn.pack(side=tk.LEFT, padx=5)
-        
-        # 上移和下移按钮
-        self.up_btn = ttk.Button(top_button_frame, text="↑ 上移", command=self.move_up)
-        self.up_btn.pack(side=tk.LEFT, padx=5)
-        
-        self.down_btn = ttk.Button(top_button_frame, text="↓ 下移", command=self.move_down)
-        self.down_btn.pack(side=tk.LEFT, padx=5)
-        
-        # 清空列表按钮
-        self.clear_btn = ttk.Button(top_button_frame, text="清空列表", command=self.clear_list)
-        self.clear_btn.pack(side=tk.LEFT, padx=5)
-        
-        # 文件列表框架
-        list_frame = ttk.Frame(left_frame)
-        list_frame.pack(fill=tk.BOTH, expand=True, pady=5)
-        
-        # 显示选中文件的列表框
-        self.file_listbox = tk.Listbox(list_frame, width=70, height=15, selectmode=tk.EXTENDED)
-        self.file_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        
-        # 绑定选择事件
-        self.file_listbox.bind('<<ListboxSelect>>', self.on_select)
-        
-        # 滚动条
-        scrollbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.file_listbox.yview)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        self.file_listbox.config(yscrollcommand=scrollbar.set)
-        
-        # 添加预览区域分隔线
-        ttk.Separator(left_frame, orient='horizontal').pack(fill='x', pady=10)
-        
-        # 预览区域标签
-        ttk.Label(left_frame, text="音频预览", font=('', 10, 'bold')).pack(pady=5)
-        
-        # 音频控制框架
-        audio_control_frame = ttk.Frame(left_frame)
-        audio_control_frame.pack(fill=tk.X, pady=5)
-        
-        # 音频进度条
-        self.audio_progress_var = tk.DoubleVar()
-        self.audio_progress = ttk.Scale(audio_control_frame, from_=0, to=100, 
-                                      orient=tk.HORIZONTAL, variable=self.audio_progress_var)
-        self.audio_progress.bind("<ButtonPress-1>", self.on_progress_press)
-        self.audio_progress.bind("<ButtonRelease-1>", self.on_progress_release)
-        self.audio_progress.pack(fill=tk.X, padx=5)
-        
-        # 音频控制按钮框架
-        audio_buttons_frame = ttk.Frame(left_frame)
-        audio_buttons_frame.pack(pady=5)
-        
-        # 合并预览和停止按钮
-        self.play_btn = ttk.Button(audio_buttons_frame, text="▶ 预览", command=self.toggle_preview)
-        self.play_btn.pack(side=tk.LEFT, padx=5)
-        
-        # 时间标签
-        self.time_label = ttk.Label(audio_buttons_frame, text="00:00 / 00:00")
-        self.time_label.pack(side=tk.LEFT, padx=10)
-        
-        # 添加合并区域分隔线
-        ttk.Separator(left_frame, orient='horizontal').pack(fill='x', pady=10)
-        
-        # 合并区域标签
-        ttk.Label(left_frame, text="合并操作", font=('', 10, 'bold')).pack(pady=5)
-        
-        # 添加输出格式选择框架
-        format_frame = ttk.Frame(left_frame)
-        format_frame.pack(pady=5)
-        
-        # 输出格式选择
-        self.output_format = tk.StringVar(value="wav")
-        ttk.Label(format_frame, text="输出格式：").pack(side=tk.LEFT, padx=5)
-        ttk.Radiobutton(format_frame, text="WAV", variable=self.output_format, 
-                        value="wav").pack(side=tk.LEFT, padx=5)
-        ttk.Radiobutton(format_frame, text="MP3", variable=self.output_format, 
-                        value="mp3").pack(side=tk.LEFT, padx=5)
-        
-        # MP3比特率选择
-        self.mp3_bitrate = tk.StringVar(value="192")
-        self.mp3_bitrate_frame = ttk.Frame(left_frame)
-        self.mp3_bitrate_frame.pack(pady=5)
-        ttk.Label(self.mp3_bitrate_frame, text="MP3比特率：").pack(side=tk.LEFT, padx=5)
-        bitrate_combo = ttk.Combobox(self.mp3_bitrate_frame, textvariable=self.mp3_bitrate, 
-                                    values=["128", "192", "256", "320"], width=5)
-        bitrate_combo.pack(side=tk.LEFT, padx=5)
-        ttk.Label(self.mp3_bitrate_frame, text="kbps").pack(side=tk.LEFT)
-        
-        # 合并按钮
-        self.merge_btn = ttk.Button(left_frame, text="合并文件", command=self.merge_files)
-        self.merge_btn.pack(pady=10)
-        
-        # 合并进度条
-        self.progress_var = tk.DoubleVar()
-        self.progress_bar = ttk.Progressbar(left_frame, variable=self.progress_var, maximum=100)
-        self.progress_bar.pack(fill=tk.X, pady=10)
-        
-        # === 右侧属性面板内容 ===
-        # 信息面板标题框架
-        info_title_frame = ttk.Frame(right_frame)
-        info_title_frame.pack(fill=tk.X, pady=10)
-        
-        # 信息标题
-        ttk.Label(info_title_frame, text="信息", font=('', 12, 'bold')).pack(side=tk.LEFT, padx=5)
-        
-        # 帮助按钮
-        help_btn = ttk.Button(info_title_frame, text="?", width=3, 
-                             command=self.show_usage_guide,
-                             style='Circle.TButton')
-        help_btn.pack(side=tk.RIGHT, padx=5)
-        
-        # 创建圆形按钮样式
-        style = ttk.Style()
-        style.configure('Circle.TButton', borderwidth=1, relief="circular",
-                       padding=0, width=3, bordercolor='gray')
-        
-        # 信息文本框
-        self.info_text = tk.Text(right_frame, wrap=tk.WORD, width=30, height=30)
-        self.info_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        self.info_text.config(state=tk.DISABLED)  # 设置为只读
-        
-        # 显示初始的使用说明
-        self.show_usage_guide()
-        
-    def show_usage_guide(self):
-        """显示使用说明"""
-        guide = """
-使用说明：
-
-1. 添加文件
-   - 点击"添加WAV文件"选择一个或多个WAV文件
-   - 支持多选文件
-
-2. 管理文件
-   - 选择文件后可以上移/下移调整顺序
-   - 可以移除选中的文件
-   - 可以清空整个列表
-
-3. 预览音频
-   - 选中文件后点击"预览"按钮
-   - 使用进度条控制播放位置
-   - 点击"停止"结束预览
-
-4. 合并文件
-   - 添加完所有文件后
-   - 选择输出格式（WAV/MP3）
-   - 如果选择MP3可以设置比特率
-   - 点击"合并文件"
-   - 选择保存位置即可
-
-提示：选中文件后将在此处显示
-详细的文件属性信息。
-"""
-        self.info_text.config(state=tk.NORMAL)
-        self.info_text.delete(1.0, tk.END)
-        self.info_text.insert(tk.END, guide)
-        self.info_text.config(state=tk.DISABLED)
-        
-    def show_file_properties(self, file_path):
-        """显示文件属性"""
+    def locate_ffmpeg(self) -> str | None:
         try:
-            # 获取文件基本信息
-            file_size = os.path.getsize(file_path)
-            audio = WAVE(file_path)
-            
-            # 使用 ffmpeg 获取详细信息
-            cmd = ['ffmpeg', '-i', file_path, '-hide_banner']
-            process = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            
-            # 解析 ffmpeg 输出
-            info = process.stderr
-            
-            # 提取关键信息
-            properties = f"文件名：{os.path.basename(file_path)}\n\n"
-            properties += f"文件大小：{self.format_size(file_size)}\n\n"
-            properties += f"时长：{self.format_time(audio.info.length)}\n\n"
-            
-            # 提取音频详细信息
-            if 'Audio:' in info:
-                audio_info = info.split('Audio:')[1].split('\n')[0]
-                properties += f"音频信息：\n{audio_info.strip()}\n\n"
-            
-            # 提取采样率、声道等信息
-            properties += f"采样率：{audio.info.sample_rate} Hz\n"
-            properties += f"声道数：{audio.info.channels}\n"
-            properties += f"比特率：{int(audio.info.bitrate/1000)} kbps\n"
-            
-            # 更新显示
-            self.update_info(properties)
-            
-        except Exception as e:
-            self.update_info(f"无法读取文件属性：{str(e)}")
-        
-    def format_size(self, size):
-        """格式化文件大小"""
-        for unit in ['B', 'KB', 'MB', 'GB']:
-            if size < 1024:
-                return f"{size:.2f} {unit}"
-            size /= 1024
-        return f"{size:.2f} TB"
-        
-    def add_files(self):
-        try:
-            initial_dir = self.config.get('last_folder', os.path.expanduser("~"))
-            files = filedialog.askopenfilenames(
-                filetypes=[("WAV files", "*.wav *.WAV")],  # 修改文件类型格式
-                title="选择WAV文件",
-                initialdir=initial_dir  # 使用上次的目录
-            )
-            
-            if files:  # files 是一个元组
-                if not hasattr(self, 'wav_files'):
-                    self.wav_files = []
-                
-                # 保存最后使用的文件夹路径
-                last_folder = os.path.dirname(files[0])
-                self.config['last_folder'] = last_folder
-                self.save_config()
-                
-                # 添加文件到列表
-                for file in files:
-                    if file:  # 确保文件路径不为空
-                        self.wav_files.append(file)
-                        self.file_listbox.insert(tk.END, os.path.basename(file))
-                
-                # 更新按钮状态
-                self.update_button_states()
-                
-        except Exception as e:
-            messagebox.showerror("错误", f"添加文件时发生错误：{str(e)}")
-    
-    def remove_selected(self):
-        selected = self.file_listbox.curselection()
-        if not selected:
+            import imageio_ffmpeg
+
+            return imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception:
+            return shutil.which("ffmpeg")
+
+    def build_ui(self) -> None:
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(1, weight=1)
+
+        top = ttk.Frame(self.root, padding=(12, 12, 12, 8))
+        top.grid(row=0, column=0, sticky="ew")
+        top.columnconfigure(1, weight=1)
+
+        ttk.Button(top, text="选择文件夹", command=self.choose_folder).grid(row=0, column=0, padx=(0, 8))
+        ttk.Entry(top, textvariable=self.selected_folder).grid(row=0, column=1, sticky="ew")
+        ttk.Button(top, text="扫描", command=self.scan_selected_folder).grid(row=0, column=2, padx=(8, 0))
+        ttk.Button(top, text="添加文件", command=self.add_files).grid(row=0, column=3, padx=(8, 0))
+
+        ttk.Checkbutton(top, text="包含子文件夹", variable=self.recursive_scan).grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(top, text="分组间隔").grid(row=1, column=1, sticky="e", pady=(8, 0), padx=(0, 8))
+        threshold = ttk.Combobox(top, textvariable=self.threshold_minutes, values=["0.5", "1", "2", "5", "10"], width=8)
+        threshold.grid(row=1, column=2, sticky="w", pady=(8, 0))
+        ttk.Label(top, text="分钟").grid(row=1, column=3, sticky="w", pady=(8, 0), padx=(6, 0))
+
+        body = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
+        body.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 8))
+
+        left = ttk.Frame(body)
+        right = ttk.Frame(body)
+        body.add(left, weight=3)
+        body.add(right, weight=2)
+
+        left.rowconfigure(1, weight=1)
+        left.columnconfigure(0, weight=1)
+        right.rowconfigure(1, weight=1)
+        right.columnconfigure(0, weight=1)
+
+        group_toolbar = ttk.Frame(left)
+        group_toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        ttk.Label(group_toolbar, text="录音会话").pack(side=tk.LEFT)
+        ttk.Button(group_toolbar, text="删除选中会话源文件", command=self.delete_selected_groups_from_disk).pack(side=tk.RIGHT, padx=(6, 0))
+        ttk.Button(group_toolbar, text="重新分组", command=self.regroup_files).pack(side=tk.RIGHT, padx=(6, 0))
+        ttk.Button(group_toolbar, text="合并选中组", command=self.merge_selected_groups).pack(side=tk.RIGHT, padx=(6, 0))
+
+        group_columns = ("index", "start", "files", "duration", "size", "output")
+        self.group_tree = ttk.Treeview(left, columns=group_columns, show="headings", selectmode="extended")
+        self.group_tree.heading("index", text="#")
+        self.group_tree.heading("start", text="开始时间")
+        self.group_tree.heading("files", text="文件数")
+        self.group_tree.heading("duration", text="时长")
+        self.group_tree.heading("size", text="原始大小")
+        self.group_tree.heading("output", text="输出文件名")
+        self.group_tree.column("index", width=48, anchor=tk.CENTER, stretch=False)
+        self.group_tree.column("start", width=150, anchor=tk.W, stretch=False)
+        self.group_tree.column("files", width=72, anchor=tk.CENTER, stretch=False)
+        self.group_tree.column("duration", width=92, anchor=tk.CENTER, stretch=False)
+        self.group_tree.column("size", width=96, anchor=tk.E, stretch=False)
+        self.group_tree.column("output", width=260, anchor=tk.W)
+        self.group_tree.grid(row=1, column=0, sticky="nsew")
+        self.group_tree.bind("<<TreeviewSelect>>", self.on_group_select)
+
+        group_scroll = ttk.Scrollbar(left, orient=tk.VERTICAL, command=self.group_tree.yview)
+        group_scroll.grid(row=1, column=1, sticky="ns")
+        self.group_tree.configure(yscrollcommand=group_scroll.set)
+
+        export_panel = ttk.LabelFrame(left, text="导出设置", padding=10)
+        export_panel.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        export_panel.columnconfigure(1, weight=1)
+
+        ttk.Label(export_panel, text="输出目录").grid(row=0, column=0, sticky="w")
+        ttk.Entry(export_panel, textvariable=self.output_folder).grid(row=0, column=1, sticky="ew", padx=8)
+        ttk.Button(export_panel, text="选择", command=self.choose_output_folder).grid(row=0, column=2)
+
+        ttk.Label(export_panel, text="格式").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        self.format_combo = ttk.Combobox(
+            export_panel,
+            textvariable=self.format_label,
+            values=[preset["label"] for preset in FORMAT_PRESETS.values()],
+            state="readonly",
+            width=18,
+        )
+        self.format_combo.grid(row=1, column=1, sticky="w", padx=8, pady=(8, 0))
+        self.format_combo.bind("<<ComboboxSelected>>", self.on_format_label_change)
+
+        self.bitrate_label = ttk.Label(export_panel, text="码率")
+        self.bitrate_label.grid(row=2, column=0, sticky="w", pady=(8, 0))
+        self.bitrate_combo = ttk.Combobox(export_panel, textvariable=self.bitrate, state="readonly", width=8)
+        self.bitrate_combo.grid(row=2, column=1, sticky="w", padx=8, pady=(8, 0))
+        ttk.Checkbutton(export_panel, text="转单声道", variable=self.mix_to_mono).grid(
+            row=2, column=1, sticky="w", padx=(100, 0), pady=(8, 0)
+        )
+
+        ttk.Checkbutton(export_panel, text="只导出选中会话", variable=self.export_selected_only).grid(
+            row=3, column=0, columnspan=2, sticky="w", pady=(8, 0)
+        )
+        ttk.Checkbutton(export_panel, text="导出成功后将源 WAV 移到废纸篓", variable=self.delete_sources_after_export).grid(
+            row=4, column=0, columnspan=3, sticky="w", pady=(8, 0)
+        )
+        self.export_button = ttk.Button(export_panel, text="开始批量导出", command=self.start_export)
+        self.export_button.grid(row=3, column=2, rowspan=2, sticky="e", pady=(8, 0))
+
+        file_toolbar = ttk.Frame(right)
+        file_toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        ttk.Label(file_toolbar, text="会话内文件").pack(side=tk.LEFT)
+        ttk.Button(file_toolbar, text="删除源文件", command=self.delete_selected_files_from_disk).pack(side=tk.RIGHT, padx=(6, 0))
+        ttk.Button(file_toolbar, text="移除文件", command=self.remove_selected_files).pack(side=tk.RIGHT, padx=(6, 0))
+        ttk.Button(file_toolbar, text="从此拆分", command=self.split_group_at_file).pack(side=tk.RIGHT, padx=(6, 0))
+
+        file_columns = ("name", "start", "duration", "size")
+        self.file_tree = ttk.Treeview(right, columns=file_columns, show="headings", selectmode="extended")
+        self.file_tree.heading("name", text="文件名")
+        self.file_tree.heading("start", text="开始时间")
+        self.file_tree.heading("duration", text="时长")
+        self.file_tree.heading("size", text="大小")
+        self.file_tree.column("name", width=250, anchor=tk.W)
+        self.file_tree.column("start", width=142, anchor=tk.W, stretch=False)
+        self.file_tree.column("duration", width=82, anchor=tk.CENTER, stretch=False)
+        self.file_tree.column("size", width=86, anchor=tk.E, stretch=False)
+        self.file_tree.grid(row=1, column=0, sticky="nsew")
+
+        file_scroll = ttk.Scrollbar(right, orient=tk.VERTICAL, command=self.file_tree.yview)
+        file_scroll.grid(row=1, column=1, sticky="ns")
+        self.file_tree.configure(yscrollcommand=file_scroll.set)
+
+        info = ttk.Frame(right)
+        info.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        info.columnconfigure(0, weight=1)
+        ttk.Label(info, textvariable=self.status_text, wraplength=430).grid(row=0, column=0, sticky="ew")
+
+        bottom = ttk.Frame(self.root, padding=(12, 0, 12, 12))
+        bottom.grid(row=2, column=0, sticky="ew")
+        bottom.columnconfigure(0, weight=1)
+        ttk.Progressbar(bottom, variable=self.progress_value, maximum=100).grid(row=0, column=0, sticky="ew")
+        ttk.Label(bottom, textvariable=self.progress_text, width=28).grid(row=0, column=1, padx=(10, 0))
+
+        self.format_label.set(FORMAT_PRESETS[self.format_choice.get()]["label"])
+
+    def choose_folder(self) -> None:
+        initial = self.selected_folder.get() or str(Path.home())
+        folder = filedialog.askdirectory(title="选择 DJI Mic 录音文件夹", initialdir=initial)
+        if folder:
+            self.selected_folder.set(folder)
+            if not self.output_folder.get():
+                self.output_folder.set(str(Path(folder) / "converted"))
+            self.scan_selected_folder()
+
+    def choose_output_folder(self) -> None:
+        initial = self.output_folder.get() or self.selected_folder.get() or str(Path.home())
+        folder = filedialog.askdirectory(title="选择输出目录", initialdir=initial)
+        if folder:
+            self.output_folder.set(folder)
+            self.save_config()
+
+    def add_files(self) -> None:
+        initial = self.selected_folder.get() or str(Path.home())
+        paths = filedialog.askopenfilenames(
+            title="添加 WAV 文件",
+            initialdir=initial,
+            filetypes=[("WAV files", "*.wav *.WAV *.wave *.WAVE"), ("All files", "*.*")],
+        )
+        if not paths:
             return
-        
-        # 从后往前删除，避免索引变化
-        for idx in reversed(selected):
-            self.file_listbox.delete(idx)
-            self.wav_files.pop(idx)
-    
-    def clear_list(self):
-        if messagebox.askyesno("确认", "确定要清空列表吗？"):
-            self.file_listbox.delete(0, tk.END)
-            self.wav_files = []
-    
-    def format_time(self, seconds):
-        minutes = int(seconds // 60)
-        seconds = int(seconds % 60)
-        return f"{minutes:02d}:{seconds:02d}"
-    
-    def update_progress(self):
-        """更新进度条"""
-        if self.is_playing and not self.is_dragging:
-            if pygame.mixer.music.get_busy():
-                current_pos = pygame.mixer.music.get_pos() / 1000.0  # 转换为秒
-                if current_pos >= 0:
-                    # 计算实际播放位置
-                    actual_pos = current_pos + self.start_offset
-                    self.current_position = actual_pos
-                    
-                    # 更新进度条
-                    if actual_pos <= self.current_audio_length:
-                        progress = (actual_pos / self.current_audio_length) * 100
-                        self.audio_progress_var.set(progress)
-                        self.time_label.config(text=f"{self.format_time(actual_pos)} / {self.format_time(self.current_audio_length)}")
+        new_files = self.inspect_paths([Path(path) for path in paths])
+        existing = {item.path for item in self.audio_files}
+        self.audio_files.extend(item for item in new_files if item.path not in existing)
+        self.audio_files.sort(key=lambda item: (item.start_time, item.path.name))
+        self.regroup_files()
+
+    def scan_selected_folder(self) -> None:
+        folder = Path(self.selected_folder.get()).expanduser()
+        if not folder.exists() or not folder.is_dir():
+            messagebox.showerror("错误", "请选择一个有效的文件夹。")
+            return
+
+        pattern = "**/*" if self.recursive_scan.get() else "*"
+        paths = [
+            path
+            for path in folder.glob(pattern)
+            if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS
+        ]
+        self.status_text.set(f"正在读取 {len(paths)} 个 WAV 文件...")
+        self.root.update_idletasks()
+
+        self.audio_files = self.inspect_paths(paths)
+        if not self.output_folder.get():
+            self.output_folder.set(str(folder / "converted"))
+        self.regroup_files()
+
+    def inspect_paths(self, paths: list[Path]) -> list[AudioFile]:
+        inspected: list[AudioFile] = []
+        skipped = 0
+        for path in sorted(paths, key=lambda item: item.name):
+            try:
+                stat = path.stat()
+                duration = self.probe_duration(path)
+                start_time = self.extract_start_time(path, stat.st_mtime)
+                inspected.append(AudioFile(path=path, duration=duration, size=stat.st_size, start_time=start_time))
+            except Exception:
+                skipped += 1
+
+        inspected.sort(key=lambda item: (item.start_time, item.path.name))
+        if skipped:
+            self.status_text.set(f"读取完成：{len(inspected)} 个文件可用，{skipped} 个文件被跳过。")
+        return inspected
+
+    def probe_duration(self, path: Path) -> float:
+        try:
+            with wave.open(str(path), "rb") as wav_file:
+                frame_rate = wav_file.getframerate()
+                if frame_rate > 0:
+                    return wav_file.getnframes() / frame_rate
+        except wave.Error:
+            pass
+
+        if not self.ffmpeg:
+            raise RuntimeError("ffmpeg is not available")
+
+        cmd = [
+            self.ffmpeg,
+            "-hide_banner",
+            "-i",
+            str(path),
+        ]
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", result.stderr)
+        if not match:
+            raise RuntimeError(f"无法读取音频时长：{path}")
+        hours = int(match.group(1))
+        minutes = int(match.group(2))
+        seconds = float(match.group(3))
+        return max(0.0, hours * 3600 + minutes * 60 + seconds)
+
+    def extract_start_time(self, path: Path, fallback_timestamp: float) -> datetime:
+        name = path.stem
+        compact_match = re.search(r"(20\d{12})", name)
+        if compact_match:
+            try:
+                return datetime.strptime(compact_match.group(1), "%Y%m%d%H%M%S")
+            except ValueError:
+                pass
+
+        separated_match = re.search(
+            r"(20\d{2})[-_. ]?(\d{2})[-_. ]?(\d{2})[-_ T]?(\d{2})[-_. ]?(\d{2})[-_. ]?(\d{2})",
+            name,
+        )
+        if separated_match:
+            try:
+                return datetime(
+                    int(separated_match.group(1)),
+                    int(separated_match.group(2)),
+                    int(separated_match.group(3)),
+                    int(separated_match.group(4)),
+                    int(separated_match.group(5)),
+                    int(separated_match.group(6)),
+                )
+            except ValueError:
+                pass
+
+        return datetime.fromtimestamp(fallback_timestamp)
+
+    def regroup_files(self) -> None:
+        threshold_seconds = self.get_threshold_minutes() * 60
+        groups: list[RecordingGroup] = []
+        current = RecordingGroup()
+
+        for audio_file in sorted(self.audio_files, key=lambda item: (item.start_time, item.path.name)):
+            if not current.files:
+                current.files.append(audio_file)
+                continue
+
+            previous = current.files[-1]
+            gap = (audio_file.start_time - previous.end_time).total_seconds()
+            if gap > threshold_seconds:
+                groups.append(current)
+                current = RecordingGroup(files=[audio_file])
             else:
-                # 播放结束
-                self.is_playing = False
-                self.start_offset = 0
-                self.current_position = 0
-                self.audio_progress_var.set(0)
-                self.time_label.config(text=f"00:00 / {self.format_time(self.current_audio_length)}")
-                self.update_button_states()
-        
-        self.window.after(100, self.update_progress)
-    
-    def on_progress_press(self, event):
-        """进度条按下事件"""
-        if self.current_audio_path:
-            self.is_dragging = True
-            pygame.mixer.music.pause()
-    
-    def on_progress_release(self, event):
-        """进度条释放事件"""
-        if self.current_audio_path and self.is_dragging:
-            # 计算新的播放位置
-            pos = (self.audio_progress_var.get() / 100.0) * self.current_audio_length
-            self.start_offset = pos  # 记录开始位置
-            self.current_position = pos
-            
-            # 重新加载并播放
-            pygame.mixer.music.load(self.current_audio_path)
-            pygame.mixer.music.play(start=pos)
-            
-            # 如果之前不是播放状态，则暂停
-            if not self.is_playing:
-                pygame.mixer.music.pause()
-            
-        self.is_dragging = False
-    
-    def toggle_preview(self):
-        """切换预览/停止状态"""
-        if self.is_playing:
-            self.stop_preview()
-        else:
-            self.preview_audio()
-    
-    def preview_audio(self):
-        selected = self.file_listbox.curselection()
-        if not selected:
-            return
-        
-        try:
-            # 获取选中文件路径
-            idx = selected[0]
-            file_path = self.wav_files[idx]
-            
-            # 获取音频时长
-            audio = WAVE(file_path)
-            self.current_audio_length = audio.info.length
-            self.current_audio_path = file_path
-            
-            # 重置播放位置
-            self.start_offset = 0
-            self.current_position = 0
-            
-            # 加载并播放音频
-            pygame.mixer.music.load(file_path)
-            pygame.mixer.music.play()
-            self.is_playing = True
-            
-            # 更新状态
-            self.update_info(f"正在播放: {os.path.basename(file_path)}")
-            self.play_btn.config(text="■ 停止")
-            
-        except Exception as e:
-            messagebox.showerror("错误", f"无法播放音频：{str(e)}")
-    
-    def stop_preview(self):
-        if pygame.mixer.music.get_busy() or self.is_playing:
-            pygame.mixer.music.stop()
-            self.is_playing = False
-            self.start_offset = 0
-            self.current_position = 0
-            self.play_btn.config(text="▶ 预览")
-            self.update_info("")  # 清空播放状态信息
-            self.audio_progress_var.set(0)
-            self.time_label.config(text="00:00 / 00:00")
-    
-    def on_closing(self):
-        """窗口关闭时保存配置"""
+                current.files.append(audio_file)
+
+        if current.files:
+            groups.append(current)
+
+        self.groups = groups
+        self.refresh_group_titles()
+        self.refresh_group_tree()
+        self.refresh_file_tree()
         self.save_config()
-        self.stop_preview()
-        pygame.mixer.quit()
-        self.window.destroy()
-    
-    def move_up(self):
-        selected = self.file_listbox.curselection()
-        if not selected or selected[0] == 0:
-            return
-        
-        idx = selected[0]
-        text = self.file_listbox.get(idx)
-        self.file_listbox.delete(idx)
-        self.file_listbox.insert(idx-1, text)
-        self.file_listbox.selection_set(idx-1)
-        self.update_wav_files_order()
-        
-    def move_down(self):
-        selected = self.file_listbox.curselection()
-        if not selected or selected[0] == self.file_listbox.size()-1:
-            return
-        
-        idx = selected[0]
-        text = self.file_listbox.get(idx)
-        self.file_listbox.delete(idx)
-        self.file_listbox.insert(idx+1, text)
-        self.file_listbox.selection_set(idx+1)
-        self.update_wav_files_order()
-        
-    def update_wav_files_order(self):
-        # 更新wav_files列表以匹配显示顺序
-        new_wav_files = []
-        for i in range(self.file_listbox.size()):
-            filename = self.file_listbox.get(i)
-            for file in self.wav_files:
-                if os.path.basename(file) == filename:
-                    new_wav_files.append(file)
-                    break
-        self.wav_files = new_wav_files
-            
-    def merge_files(self):
-        if not hasattr(self, 'wav_files') or not self.wav_files:
-            messagebox.showerror("错误", "请先添加WAV文件！")
-            return
-        
-        try:
-            # 选择输出文件位置
-            initial_dir = self.config.get('last_folder', os.path.expanduser("~"))
-            output_format = self.output_format.get()
-            filetypes = [("WAV files", "*.wav")] if output_format == "wav" else [("MP3 files", "*.mp3")]
-            defaultext = ".wav" if output_format == "wav" else ".mp3"
-            
-            output_path = filedialog.asksaveasfilename(
-                defaultextension=defaultext,
-                filetypes=filetypes,
-                initialdir=initial_dir,
-                title="选择保存位置"
-            )
-            
-            if output_path:
-                # 使用临时文件
-                with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as temp_file:
-                    filelist_path = temp_file.name
-                    
-                    # 写入文件列表
-                    for wav_file in self.wav_files:
-                        temp_file.write(f"file '{wav_file}'\n")
-                
-                try:
-                    # 保存最后使用的文件夹路径
-                    self.config['last_folder'] = os.path.dirname(output_path)
-                    self.save_config()
-                    
-                    # 计算总时长
-                    total_duration = 0
-                    for wav_file in self.wav_files:
-                        audio = WAVE(wav_file)
-                        total_duration += audio.info.length
-                    
-                    self.progress_var.set(0)
-                    self.update_info("正在合并文件... 0%")
-                    self.window.update()
-                    
-                    # 根据输出格式设置ffmpeg命令
-                    if output_format == "wav":
-                        cmd = [
-                            'ffmpeg', '-y', '-f', 'concat', '-safe', '0',
-                            '-i', filelist_path, '-c', 'copy', output_path,
-                            '-progress', 'pipe:1'
-                        ]
-                    else:
-                        # MP3输出
-                        bitrate = self.mp3_bitrate.get()
-                        cmd = [
-                            'ffmpeg', '-y', '-f', 'concat', '-safe', '0',
-                            '-i', filelist_path,
-                            '-c:a', 'libmp3lame', '-b:a', f'{bitrate}k',
-                            output_path,
-                            '-progress', 'pipe:1'
-                        ]
-                    
-                    process = subprocess.Popen(
-                        cmd,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                        universal_newlines=True,
-                        bufsize=1
-                    )
-                    
-                    # 读取进度
-                    while True:
-                        line = process.stdout.readline()
-                        if not line and process.poll() is not None:
-                            break
-                        
-                        if line.startswith('out_time_ms='):
-                            try:
-                                current_ms = int(line.split('=')[1])
-                                current_duration = current_ms / 1000000
-                                progress = min(100, (current_duration / total_duration) * 100)
-                                self.progress_var.set(progress)
-                                self.update_info(f"正在合并文件... {progress:.1f}%")
-                                self.window.update()
-                            except (ValueError, IndexError):
-                                continue
-                    
-                    if process.returncode == 0:
-                        self.progress_var.set(100)
-                        success_msg = "合并完成！\n\n"
-                        # 添加输出文件信息
-                        try:
-                            cmd = ['ffmpeg', '-i', output_path, '-hide_banner']
-                            process = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-                            if process.stderr:
-                                success_msg += "输出文件信息：\n\n"
-                                info_lines = process.stderr.split('\n')
-                                for line in info_lines:
-                                    if any(key in line.lower() for key in ['duration', 'audio:', 'stream']):
-                                        success_msg += f"{line.strip()}\n"
-                        except Exception as e:
-                            success_msg += f"无法获取输出文件信息：{str(e)}"
-                        
-                        self.update_info(success_msg)
-                        self.window.bell()
-                        messagebox.showinfo("成功", "文件合并完成！")
-                    else:
-                        self.progress_var.set(0)
-                        error_message = process.stderr.read()
-                        self.update_info(f"合并失败：\n\n{error_message}")
-                        messagebox.showerror("错误", "合并失败，详细信息请查看右侧面板。")
-                    
-                finally:
-                    # 清理临时文件
-                    try:
-                        os.unlink(filelist_path)
-                    except:
-                        pass
-                    
-        except Exception as e:
-            self.progress_var.set(0)
-            messagebox.showerror("错误", f"发生错误：{str(e)}")
-    
-    def update_info(self, text):
-        """更新信息面板内容"""
-        self.info_text.config(state=tk.NORMAL)
-        self.info_text.delete(1.0, tk.END)
-        self.info_text.insert(tk.END, text)
-        self.info_text.config(state=tk.DISABLED)
-    
-    def update_button_states(self):
-        """更新按钮状态"""
-        has_files = hasattr(self, 'wav_files') and len(self.wav_files) > 0
-        has_selection = len(self.file_listbox.curselection()) > 0
-        
-        # 设置按钮状态
-        self.play_btn.state(['!disabled'] if has_selection else ['disabled'])
-        self.up_btn.state(['!disabled'] if has_selection else ['disabled'])
-        self.down_btn.state(['!disabled'] if has_selection else ['disabled'])
-        self.remove_btn.state(['!disabled'] if has_selection else ['disabled'])
-        self.merge_btn.state(['!disabled'] if has_files else ['disabled'])
-        self.clear_btn.state(['!disabled'] if has_files else ['disabled'])
-
-    def on_select(self, event):
-        """当列表选择改变时调用"""
-        self.update_button_states()
-        
-        # 更新属性显示
-        selected = self.file_listbox.curselection()
-        if selected:
-            # 如果正在播放，停止播放
-            if self.is_playing:
-                self.stop_preview()
-            
-            # 如果选中多个文件，显示选中数量
-            if len(selected) > 1:
-                total_files = self.file_listbox.size()
-                self.update_info(f"已选择 {len(selected)} 个文件（共 {total_files} 个文件）")
-            else:
-                # 显示单个文件的属性
-                file_path = self.wav_files[selected[0]]
-                self.show_file_properties(file_path)
+        if self.audio_files:
+            self.status_text.set(f"已识别 {len(self.audio_files)} 个 WAV 文件，自动分成 {len(self.groups)} 个录音会话。")
         else:
-            # 不再自动显示使用说明
-            self.update_info("")
-    
-    def run(self):
-        self.window.mainloop()
+            self.status_text.set("没有找到 WAV 文件。")
+        self.update_button_states()
+
+    def refresh_group_titles(self) -> None:
+        for index, group in enumerate(self.groups, start=1):
+            if group.start_time:
+                group.title = f"{group.start_time:%Y-%m-%d_%H-%M-%S}_session-{index:02d}"
+            else:
+                group.title = f"session-{index:02d}"
+
+    def refresh_group_tree(self) -> None:
+        selected_indices = self.get_selected_group_indices()
+        self.group_tree.delete(*self.group_tree.get_children())
+        for index, group in enumerate(self.groups):
+            self.group_tree.insert(
+                "",
+                tk.END,
+                iid=str(index),
+                values=(
+                    index + 1,
+                    self.format_datetime(group.start_time),
+                    len(group.files),
+                    self.format_duration(group.duration),
+                    self.format_size(group.size),
+                    self.output_name_for_group(group),
+                ),
+            )
+
+        for index in selected_indices:
+            if 0 <= index < len(self.groups):
+                self.group_tree.selection_add(str(index))
+
+    def refresh_file_tree(self) -> None:
+        self.file_tree.delete(*self.file_tree.get_children())
+        group = self.get_primary_selected_group()
+        if not group:
+            return
+        for index, audio_file in enumerate(group.files):
+            self.file_tree.insert(
+                "",
+                tk.END,
+                iid=str(index),
+                values=(
+                    audio_file.display_name,
+                    self.format_datetime(audio_file.start_time),
+                    self.format_duration(audio_file.duration),
+                    self.format_size(audio_file.size),
+                ),
+            )
+
+    def on_group_select(self, _event: tk.Event) -> None:
+        self.refresh_file_tree()
+        self.update_button_states()
+
+    def merge_selected_groups(self) -> None:
+        indices = sorted(self.get_selected_group_indices())
+        if len(indices) < 2:
+            messagebox.showinfo("提示", "请选择至少两个录音会话。")
+            return
+
+        merged_files: list[AudioFile] = []
+        new_groups: list[RecordingGroup] = []
+        for index, group in enumerate(self.groups):
+            if index in indices:
+                merged_files.extend(group.files)
+                if index == indices[-1]:
+                    new_groups.append(RecordingGroup(files=sorted(merged_files, key=lambda item: item.start_time)))
+            else:
+                new_groups.append(group)
+
+        self.groups = new_groups
+        self.refresh_group_titles()
+        self.refresh_group_tree()
+        self.refresh_file_tree()
+        self.update_button_states()
+        self.status_text.set("已合并选中的录音会话。")
+
+    def split_group_at_file(self) -> None:
+        group_index = self.get_primary_selected_group_index()
+        if group_index is None:
+            return
+        file_indices = sorted(self.get_selected_file_indices())
+        if not file_indices:
+            messagebox.showinfo("提示", "请选择要作为新会话开头的文件。")
+            return
+
+        split_at = file_indices[0]
+        group = self.groups[group_index]
+        if split_at <= 0 or split_at >= len(group.files):
+            messagebox.showinfo("提示", "请选择会话中间的文件来拆分。")
+            return
+
+        first = RecordingGroup(files=group.files[:split_at])
+        second = RecordingGroup(files=group.files[split_at:])
+        self.groups[group_index : group_index + 1] = [first, second]
+        self.refresh_group_titles()
+        self.refresh_group_tree()
+        self.group_tree.selection_set(str(group_index + 1))
+        self.refresh_file_tree()
+        self.update_button_states()
+        self.status_text.set("已拆分录音会话。")
+
+    def remove_selected_files(self) -> None:
+        group_index = self.get_primary_selected_group_index()
+        if group_index is None:
+            return
+        file_indices = sorted(self.get_selected_file_indices(), reverse=True)
+        if not file_indices:
+            return
+
+        group = self.groups[group_index]
+        removed_paths = set()
+        for index in file_indices:
+            if 0 <= index < len(group.files):
+                removed_paths.add(group.files[index].path)
+                del group.files[index]
+
+        self.audio_files = [item for item in self.audio_files if item.path not in removed_paths]
+        if not group.files:
+            del self.groups[group_index]
+
+        self.refresh_group_titles()
+        self.refresh_group_tree()
+        self.refresh_file_tree()
+        self.update_button_states()
+        self.status_text.set("已移除选中的文件。")
+
+    def delete_selected_files_from_disk(self) -> None:
+        group_index = self.get_primary_selected_group_index()
+        if group_index is None:
+            return
+
+        group = self.groups[group_index]
+        file_indices = self.get_selected_file_indices()
+        files = [group.files[index] for index in file_indices if 0 <= index < len(group.files)]
+        self.delete_audio_files_from_disk(files)
+
+    def delete_selected_groups_from_disk(self) -> None:
+        indices = self.get_selected_group_indices()
+        files: list[AudioFile] = []
+        for index in indices:
+            if 0 <= index < len(self.groups):
+                files.extend(self.groups[index].files)
+        self.delete_audio_files_from_disk(files)
+
+    def delete_audio_files_from_disk(self, files: list[AudioFile]) -> None:
+        if not files:
+            return
+
+        count = len(files)
+        if not messagebox.askyesno(
+            "确认删除源文件",
+            f"将 {count} 个源 WAV 文件移到废纸篓/回收站。\n\n这个操作不会删除已经导出的文件。是否继续？",
+        ):
+            return
+
+        paths = [audio_file.path for audio_file in files]
+        try:
+            self.move_paths_to_trash(paths)
+        except Exception as exc:
+            messagebox.showerror("删除失败", str(exc))
+            return
+
+        self.remove_paths_from_state(set(paths))
+        self.status_text.set(f"已将 {count} 个源 WAV 文件移到废纸篓/回收站。")
+
+    def move_paths_to_trash(self, paths: list[Path]) -> None:
+        existing_paths = [path for path in paths if path.exists()]
+        if send2trash is None:
+            raise RuntimeError("缺少 send2trash 依赖，请先运行 ./setup.sh。")
+
+        for path in existing_paths:
+            send2trash(str(path))
+
+    def remove_paths_from_state(self, paths: set[Path]) -> None:
+        self.audio_files = [item for item in self.audio_files if item.path not in paths]
+        for group in self.groups:
+            group.files = [item for item in group.files if item.path not in paths]
+        self.groups = [group for group in self.groups if group.files]
+        self.refresh_group_titles()
+        self.refresh_group_tree()
+        self.refresh_file_tree()
+        self.update_button_states()
+
+    def start_export(self) -> None:
+        if self.is_exporting:
+            return
+        if not self.ffmpeg:
+            messagebox.showerror("错误", "未找到 ffmpeg，请先安装 ffmpeg。")
+            return
+
+        output_folder = Path(self.output_folder.get()).expanduser()
+        if not output_folder:
+            messagebox.showerror("错误", "请选择输出目录。")
+            return
+
+        groups = self.get_groups_to_export()
+        if not groups:
+            messagebox.showerror("错误", "没有可导出的录音会话。")
+            return
+
+        delete_sources = self.delete_sources_after_export.get()
+        self.save_config()
+        self.is_exporting = True
+        self.progress_value.set(0)
+        self.progress_text.set("准备导出...")
+        self.status_text.set("正在导出，请稍等。")
+        self.update_button_states()
+
+        worker = threading.Thread(target=self.export_worker, args=(groups, output_folder, delete_sources), daemon=True)
+        worker.start()
+
+    def export_worker(self, groups: list[RecordingGroup], output_folder: Path, delete_sources: bool) -> None:
+        try:
+            output_folder.mkdir(parents=True, exist_ok=True)
+            total_duration = max(1.0, sum(group.duration for group in groups))
+            completed_duration = 0.0
+            outputs: list[Path] = []
+            source_paths = [audio_file.path for group in groups for audio_file in group.files]
+
+            for group_index, group in enumerate(groups, start=1):
+                output_path = self.unique_output_path(output_folder / self.output_name_for_group(group))
+                self.work_queue.put(("status", f"正在导出 {group_index}/{len(groups)}：{output_path.name}"))
+                self.export_group(group, output_path, completed_duration, total_duration)
+                completed_duration += group.duration
+                outputs.append(output_path)
+                self.work_queue.put(("progress", min(100.0, completed_duration / total_duration * 100)))
+
+            deleted_paths: list[Path] = []
+            if delete_sources:
+                self.move_paths_to_trash(source_paths)
+                deleted_paths = source_paths
+
+            self.work_queue.put(("done", {"outputs": outputs, "deleted_paths": deleted_paths}))
+        except Exception as exc:
+            self.work_queue.put(("error", str(exc)))
+        finally:
+            self.current_process = None
+
+    def export_group(
+        self,
+        group: RecordingGroup,
+        output_path: Path,
+        completed_duration: float,
+        total_duration: float,
+    ) -> None:
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".txt", delete=False) as filelist:
+            filelist_path = Path(filelist.name)
+            for audio_file in group.files:
+                filelist.write(f"file '{self.escape_concat_path(audio_file.path)}'\n")
+
+        try:
+            cmd = self.build_ffmpeg_command(filelist_path, output_path)
+            self.current_process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+            assert self.current_process.stdout is not None
+            output_lines: list[str] = []
+            for line in self.current_process.stdout:
+                output_lines.append(line)
+                progress_seconds = self.parse_progress_seconds(line)
+                if progress_seconds is not None:
+                    overall = (completed_duration + min(progress_seconds, group.duration)) / total_duration * 100
+                    self.work_queue.put(("progress", min(99.0, overall)))
+
+            return_code = self.current_process.wait()
+            if return_code != 0:
+                raise RuntimeError("ffmpeg 导出失败：\n" + "".join(output_lines[-40:]))
+        finally:
+            try:
+                filelist_path.unlink()
+            except OSError:
+                pass
+
+    def build_ffmpeg_command(self, filelist_path: Path, output_path: Path) -> list[str]:
+        output_format = self.format_choice.get()
+        preset = FORMAT_PRESETS[output_format]
+        cmd = [
+            self.ffmpeg or "ffmpeg",
+            "-hide_banner",
+            "-y",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(filelist_path),
+            "-vn",
+            *preset["codec_args"],
+        ]
+
+        if output_format in {"m4a", "mp3"}:
+            cmd.extend(["-b:a", f"{self.bitrate.get()}k"])
+            if self.mix_to_mono.get():
+                cmd.extend(["-ac", "1"])
+            cmd.extend(["-ar", "48000"])
+
+        if output_format == "m4a":
+            cmd.extend(["-movflags", "+faststart"])
+
+        cmd.extend(["-progress", "pipe:1", "-nostats", str(output_path)])
+        return cmd
+
+    def drain_work_queue(self) -> None:
+        try:
+            while True:
+                kind, payload = self.work_queue.get_nowait()
+                if kind == "progress":
+                    self.progress_value.set(float(payload))
+                    self.progress_text.set(f"{float(payload):.1f}%")
+                elif kind == "status":
+                    self.status_text.set(str(payload))
+                elif kind == "done":
+                    result = payload if isinstance(payload, dict) else {}
+                    outputs = result.get("outputs", [])
+                    deleted_paths = result.get("deleted_paths", [])
+                    if deleted_paths:
+                        self.remove_paths_from_state(set(deleted_paths))
+                    self.is_exporting = False
+                    self.progress_value.set(100)
+                    self.progress_text.set("完成")
+                    self.update_button_states()
+                    suffix = f"，并移除了 {len(deleted_paths)} 个源 WAV" if deleted_paths else ""
+                    self.status_text.set(f"导出完成：{len(outputs)} 个文件{suffix}。")
+                    messagebox.showinfo("完成", f"已导出 {len(outputs)} 个文件{suffix}。")
+                elif kind == "error":
+                    self.is_exporting = False
+                    self.progress_value.set(0)
+                    self.progress_text.set("失败")
+                    self.update_button_states()
+                    self.status_text.set("导出失败。")
+                    messagebox.showerror("导出失败", str(payload))
+        except queue.Empty:
+            pass
+        self.root.after(120, self.drain_work_queue)
+
+    def update_format_controls(self) -> None:
+        output_format = self.format_choice.get()
+        preset = FORMAT_PRESETS[output_format]
+        self.format_label.set(preset["label"])
+        self.bitrate_combo.configure(values=preset["bitrates"])
+        if preset["bitrates"]:
+            if self.bitrate.get() not in preset["bitrates"]:
+                self.bitrate.set(preset["default_bitrate"])
+            self.bitrate_combo.configure(state="readonly")
+            self.bitrate_label.configure(state="normal")
+        else:
+            self.bitrate.set("")
+            self.bitrate_combo.configure(state="disabled")
+            self.bitrate_label.configure(state="disabled")
+        self.refresh_group_tree()
+
+    def on_format_label_change(self, _event: tk.Event) -> None:
+        label = self.format_label.get()
+        for key, preset in FORMAT_PRESETS.items():
+            if preset["label"] == label:
+                self.format_choice.set(key)
+                break
+        self.update_format_controls()
+        self.save_config()
+
+    def normalize_format_key(self, value: object) -> str:
+        text = str(value)
+        if text in FORMAT_PRESETS:
+            return text
+        for key, preset in FORMAT_PRESETS.items():
+            if text == preset["label"]:
+                return key
+        return "m4a"
+
+    def update_button_states(self) -> None:
+        has_files = bool(self.audio_files)
+        has_groups = bool(self.groups)
+        self.export_button.configure(state=tk.DISABLED if self.is_exporting or not has_groups else tk.NORMAL)
+        for widget in (self.group_tree, self.file_tree):
+            widget.configure(selectmode="none" if self.is_exporting else "extended")
+        if not has_files and not self.is_exporting:
+            self.progress_text.set("")
+            self.progress_value.set(0)
+
+    def get_groups_to_export(self) -> list[RecordingGroup]:
+        if self.export_selected_only.get():
+            indices = self.get_selected_group_indices()
+            return [self.groups[index] for index in indices if 0 <= index < len(self.groups)]
+        return list(self.groups)
+
+    def get_primary_selected_group(self) -> RecordingGroup | None:
+        index = self.get_primary_selected_group_index()
+        return self.groups[index] if index is not None else None
+
+    def get_primary_selected_group_index(self) -> int | None:
+        indices = self.get_selected_group_indices()
+        return indices[0] if indices else None
+
+    def get_selected_group_indices(self) -> list[int]:
+        return sorted(int(item) for item in self.group_tree.selection() if item.isdigit())
+
+    def get_selected_file_indices(self) -> list[int]:
+        return sorted(int(item) for item in self.file_tree.selection() if item.isdigit())
+
+    def get_threshold_minutes(self) -> float:
+        try:
+            return max(0.0, float(self.threshold_minutes.get()))
+        except ValueError:
+            return 2.0
+
+    def output_name_for_group(self, group: RecordingGroup) -> str:
+        extension = FORMAT_PRESETS[self.format_choice.get()]["extension"]
+        return self.sanitize_filename(group.title) + extension
+
+    def unique_output_path(self, path: Path) -> Path:
+        if not path.exists():
+            return path
+        stem = path.stem
+        suffix = path.suffix
+        parent = path.parent
+        counter = 2
+        while True:
+            candidate = parent / f"{stem}-{counter}{suffix}"
+            if not candidate.exists():
+                return candidate
+            counter += 1
+
+    def parse_progress_seconds(self, line: str) -> float | None:
+        if line.startswith("out_time_ms=") or line.startswith("out_time_us="):
+            try:
+                return int(line.split("=", 1)[1]) / 1_000_000
+            except ValueError:
+                return None
+        if line.startswith("out_time="):
+            value = line.split("=", 1)[1].strip()
+            try:
+                hours, minutes, seconds = value.split(":")
+                return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+            except ValueError:
+                return None
+        return None
+
+    def escape_concat_path(self, path: Path) -> str:
+        return str(path).replace("'", "'\\''")
+
+    def sanitize_filename(self, name: str) -> str:
+        cleaned = re.sub(r"[\\/:*?\"<>|]+", "-", name)
+        cleaned = re.sub(r"\s+", "_", cleaned).strip("._-")
+        return cleaned or "recording"
+
+    def format_datetime(self, value: datetime | None) -> str:
+        return value.strftime("%Y-%m-%d %H:%M:%S") if value else "-"
+
+    def format_duration(self, seconds: float) -> str:
+        seconds = int(round(seconds))
+        hours, remainder = divmod(seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        if hours:
+            return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+        return f"{minutes:02d}:{seconds:02d}"
+
+    def format_size(self, size: int) -> str:
+        value = float(size)
+        for unit in ("B", "KB", "MB", "GB"):
+            if value < 1024:
+                return f"{value:.1f} {unit}"
+            value /= 1024
+        return f"{value:.1f} TB"
+
+    def on_close(self) -> None:
+        self.save_config()
+        if self.current_process and self.current_process.poll() is None:
+            self.current_process.terminate()
+        self.root.destroy()
+
+    def run(self) -> None:
+        self.root.mainloop()
+
 
 if __name__ == "__main__":
-    app = WavMerger()
+    app = WavMergerApp()
     app.run()
