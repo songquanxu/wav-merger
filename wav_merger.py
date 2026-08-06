@@ -13,6 +13,7 @@ import queue
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import wave
@@ -100,8 +101,8 @@ class WavMergerApp:
     def __init__(self) -> None:
         self.root = tk.Tk()
         self.root.title(APP_TITLE)
-        self.root.geometry("1180x760")
-        self.root.minsize(980, 640)
+        self.root.geometry("1220x800")
+        self.root.minsize(1040, 680)
 
         self.config = self.load_config()
         self.ffmpeg = self.locate_ffmpeg()
@@ -119,6 +120,9 @@ class WavMergerApp:
         self.export_selected_only = tk.BooleanVar(value=False)
         self.delete_sources_after_export = tk.BooleanVar(value=self.config.get("delete_sources_after_export", False))
         self.status_text = tk.StringVar(value="请选择 DJI Mic 录音文件夹。")
+        self.library_summary = tk.StringVar(value="尚未导入录音")
+        self.selection_summary = tk.StringVar(value="选择左侧会话，查看其中的录音文件")
+        self.export_button_text = tk.StringVar(value="导出会话")
         self.progress_text = tk.StringVar(value="")
         self.progress_value = tk.DoubleVar(value=0)
         self.work_queue: queue.Queue[tuple[str, object]] = queue.Queue()
@@ -166,135 +170,277 @@ class WavMergerApp:
         except Exception:
             return shutil.which("ffmpeg")
 
+    def configure_styles(self) -> None:
+        style = ttk.Style(self.root)
+        if "clam" in style.theme_names():
+            style.theme_use("clam")
+
+        background = "#f4f6f8"
+        panel = "#ffffff"
+        text = "#18212f"
+        muted = "#667085"
+        border = "#d9dee7"
+        accent = "#1769e0"
+
+        self.root.configure(background=background)
+        style.configure(".", font=("Helvetica Neue", 13), foreground=text)
+        style.configure("TFrame", background=panel)
+        style.configure("Header.TFrame", background="#eef4ff")
+        style.configure("Panel.TFrame", background=panel, borderwidth=1, relief="solid")
+        style.configure("Status.TFrame", background=background)
+        style.configure("TLabel", background=panel, foreground=text)
+        style.configure(
+            "Title.TLabel",
+            background="#eef4ff",
+            foreground="#12213a",
+            font=("Helvetica Neue", 22, "bold"),
+        )
+        style.configure(
+            "Subtitle.TLabel",
+            background="#eef4ff",
+            foreground=muted,
+            font=("Helvetica Neue", 12),
+        )
+        style.configure(
+            "Summary.TLabel",
+            background="#dce9ff",
+            foreground="#174ea6",
+            font=("Helvetica Neue", 12, "bold"),
+            padding=(12, 7),
+        )
+        style.configure("Section.TLabel", background=panel, foreground=text, font=("Helvetica Neue", 15, "bold"))
+        style.configure("Muted.TLabel", background=panel, foreground=muted, font=("Helvetica Neue", 12))
+        style.configure("Status.TLabel", background=background, foreground=muted, font=("Helvetica Neue", 12))
+        style.configure("TButton", padding=(12, 7), background="#f7f8fa", foreground=text, bordercolor=border)
+        style.map("TButton", background=[("active", "#edf0f4")], bordercolor=[("focus", "#94b9f5")])
+        style.configure("Accent.TButton", background="#e8f0fe", foreground="#174ea6", bordercolor="#a9c7f5")
+        style.map("Accent.TButton", background=[("active", "#d7e6fd")])
+        style.configure(
+            "Primary.TButton",
+            background=accent,
+            foreground="#ffffff",
+            bordercolor=accent,
+            font=("Helvetica Neue", 13, "bold"),
+            padding=(18, 10),
+        )
+        style.map(
+            "Primary.TButton",
+            background=[("active", "#0f56bd"), ("disabled", "#aebed6")],
+            foreground=[("disabled", "#eef2f7")],
+        )
+        style.configure("Danger.TButton", foreground="#b42318", background="#fff7f6", bordercolor="#efc6c2")
+        style.map("Danger.TButton", background=[("active", "#fee9e7")])
+        style.configure("TEntry", padding=(8, 7), fieldbackground="#ffffff", bordercolor=border)
+        style.configure("Path.TEntry", padding=(9, 8))
+        style.configure("TCombobox", padding=(7, 6), fieldbackground="#ffffff", bordercolor=border)
+        style.configure("TCheckbutton", background=panel, foreground=text)
+        style.configure("TRadiobutton", background=panel, foreground=text)
+        style.configure(
+            "Treeview",
+            rowheight=32,
+            background="#ffffff",
+            fieldbackground="#ffffff",
+            foreground=text,
+            bordercolor=border,
+        )
+        style.configure(
+            "Treeview.Heading",
+            background="#f6f7f9",
+            foreground="#475467",
+            font=("Helvetica Neue", 11, "bold"),
+            padding=(7, 8),
+            relief="flat",
+        )
+        style.map("Treeview", background=[("selected", "#dce9ff")], foreground=[("selected", "#123b73")])
+        style.configure("TPanedwindow", background=background)
+        style.configure("TSeparator", background=border)
+
     def build_ui(self) -> None:
+        self.configure_styles()
         self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(1, weight=1)
+        self.root.rowconfigure(2, weight=1)
 
-        top = ttk.Frame(self.root, padding=(12, 12, 12, 8))
-        top.grid(row=0, column=0, sticky="ew")
-        top.columnconfigure(1, weight=1)
+        header = ttk.Frame(self.root, style="Header.TFrame", padding=(24, 18))
+        header.grid(row=0, column=0, sticky="ew")
+        header.columnconfigure(0, weight=1)
+        ttk.Label(header, text="DJI Mic 录音整理", style="Title.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            header,
+            text="按录制时间自动整理分段录音，合并并压缩为更方便使用的音频文件",
+            style="Subtitle.TLabel",
+        ).grid(row=1, column=0, sticky="w", pady=(3, 0))
+        ttk.Label(header, textvariable=self.library_summary, style="Summary.TLabel").grid(
+            row=0, column=1, rowspan=2, sticky="e"
+        )
 
-        ttk.Button(top, text="选择文件夹", command=self.choose_folder).grid(row=0, column=0, padx=(0, 8))
-        ttk.Entry(top, textvariable=self.selected_folder).grid(row=0, column=1, sticky="ew")
-        ttk.Button(top, text="扫描", command=self.scan_selected_folder).grid(row=0, column=2, padx=(8, 0))
-        ttk.Button(top, text="添加文件", command=self.add_files).grid(row=0, column=3, padx=(8, 0))
+        source = ttk.Frame(self.root, style="Panel.TFrame", padding=(18, 14))
+        source.grid(row=1, column=0, sticky="ew", padx=18, pady=(16, 12))
+        source.columnconfigure(1, weight=1)
+        ttk.Label(source, text="1  导入录音", style="Section.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 16))
+        ttk.Entry(source, textvariable=self.selected_folder, style="Path.TEntry").grid(row=0, column=1, sticky="ew")
+        ttk.Button(source, text="选择文件夹", command=self.choose_folder).grid(row=0, column=2, padx=(8, 0))
+        ttk.Button(source, text="扫描文件夹", command=self.scan_selected_folder, style="Accent.TButton").grid(
+            row=0, column=3, padx=(8, 0)
+        )
+        ttk.Button(source, text="添加 WAV", command=self.add_files).grid(row=0, column=4, padx=(8, 0))
 
-        ttk.Checkbutton(top, text="包含子文件夹", variable=self.recursive_scan).grid(row=1, column=0, sticky="w", pady=(8, 0))
-        ttk.Label(top, text="分组间隔").grid(row=1, column=1, sticky="e", pady=(8, 0), padx=(0, 8))
-        threshold = ttk.Combobox(top, textvariable=self.threshold_minutes, values=["0.5", "1", "2", "5", "10"], width=8)
-        threshold.grid(row=1, column=2, sticky="w", pady=(8, 0))
-        ttk.Label(top, text="分钟").grid(row=1, column=3, sticky="w", pady=(8, 0), padx=(6, 0))
+        source_options = ttk.Frame(source)
+        source_options.grid(row=1, column=1, columnspan=4, sticky="w", pady=(10, 0))
+        ttk.Checkbutton(source_options, text="包含子文件夹", variable=self.recursive_scan).pack(side=tk.LEFT)
+        ttk.Separator(source_options, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=14)
+        ttk.Label(source_options, text="相邻录音间隔超过", style="Muted.TLabel").pack(side=tk.LEFT)
+        threshold = ttk.Combobox(
+            source_options,
+            textvariable=self.threshold_minutes,
+            values=["0.5", "1", "2", "5", "10"],
+            width=5,
+        )
+        threshold.pack(side=tk.LEFT, padx=6)
+        threshold.bind("<<ComboboxSelected>>", lambda _event: self.regroup_files())
+        ttk.Label(source_options, text="分钟时分为新会话", style="Muted.TLabel").pack(side=tk.LEFT)
 
         body = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
-        body.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 8))
-
-        left = ttk.Frame(body)
-        right = ttk.Frame(body)
+        body.grid(row=2, column=0, sticky="nsew", padx=18, pady=(0, 12))
+        left = ttk.Frame(body, style="Panel.TFrame", padding=16)
+        right = ttk.Frame(body, style="Panel.TFrame", padding=16)
         body.add(left, weight=3)
         body.add(right, weight=2)
 
-        left.rowconfigure(1, weight=1)
+        left.rowconfigure(2, weight=1)
         left.columnconfigure(0, weight=1)
-        right.rowconfigure(1, weight=1)
+        right.rowconfigure(2, weight=1)
         right.columnconfigure(0, weight=1)
 
         group_toolbar = ttk.Frame(left)
-        group_toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 6))
-        ttk.Label(group_toolbar, text="录音会话").pack(side=tk.LEFT)
-        ttk.Button(group_toolbar, text="删除选中会话源文件", command=self.delete_selected_groups_from_disk).pack(side=tk.RIGHT, padx=(6, 0))
-        ttk.Button(group_toolbar, text="重新分组", command=self.regroup_files).pack(side=tk.RIGHT, padx=(6, 0))
-        ttk.Button(group_toolbar, text="合并选中组", command=self.merge_selected_groups).pack(side=tk.RIGHT, padx=(6, 0))
+        group_toolbar.grid(row=0, column=0, columnspan=2, sticky="ew")
+        group_toolbar.columnconfigure(0, weight=1)
+        ttk.Label(group_toolbar, text="2  整理会话", style="Section.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Button(group_toolbar, text="自动分组", command=self.regroup_files).grid(row=0, column=1, padx=(8, 0))
+        ttk.Button(group_toolbar, text="合并选中", command=self.merge_selected_groups).grid(row=0, column=2, padx=(8, 0))
+        ttk.Button(
+            group_toolbar,
+            text="移到废纸篓",
+            command=self.delete_selected_groups_from_disk,
+            style="Danger.TButton",
+        ).grid(row=0, column=3, padx=(8, 0))
+        ttk.Label(
+            left,
+            text="系统已按时间自动分组；可多选会话后合并，也可在右侧从某个文件处拆分。",
+            style="Muted.TLabel",
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(5, 12))
 
-        group_columns = ("index", "start", "files", "duration", "size", "output")
+        group_columns = ("start", "files", "duration", "size")
         self.group_tree = ttk.Treeview(left, columns=group_columns, show="headings", selectmode="extended")
-        self.group_tree.heading("index", text="#")
-        self.group_tree.heading("start", text="开始时间")
-        self.group_tree.heading("files", text="文件数")
+        self.group_tree.heading("start", text="录音会话")
+        self.group_tree.heading("files", text="分段")
         self.group_tree.heading("duration", text="时长")
-        self.group_tree.heading("size", text="原始大小")
-        self.group_tree.heading("output", text="输出文件名")
-        self.group_tree.column("index", width=48, anchor=tk.CENTER, stretch=False)
-        self.group_tree.column("start", width=150, anchor=tk.W, stretch=False)
-        self.group_tree.column("files", width=72, anchor=tk.CENTER, stretch=False)
+        self.group_tree.heading("size", text="原始体积")
+        self.group_tree.column("start", width=190, minwidth=150, anchor=tk.W)
+        self.group_tree.column("files", width=62, anchor=tk.CENTER, stretch=False)
         self.group_tree.column("duration", width=92, anchor=tk.CENTER, stretch=False)
-        self.group_tree.column("size", width=96, anchor=tk.E, stretch=False)
-        self.group_tree.column("output", width=260, anchor=tk.W)
-        self.group_tree.grid(row=1, column=0, sticky="nsew")
+        self.group_tree.column("size", width=100, anchor=tk.E, stretch=False)
+        self.group_tree.grid(row=2, column=0, sticky="nsew")
         self.group_tree.bind("<<TreeviewSelect>>", self.on_group_select)
-
         group_scroll = ttk.Scrollbar(left, orient=tk.VERTICAL, command=self.group_tree.yview)
-        group_scroll.grid(row=1, column=1, sticky="ns")
+        group_scroll.grid(row=2, column=1, sticky="ns")
         self.group_tree.configure(yscrollcommand=group_scroll.set)
 
-        export_panel = ttk.LabelFrame(left, text="导出设置", padding=10)
-        export_panel.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        file_toolbar = ttk.Frame(right)
+        file_toolbar.grid(row=0, column=0, columnspan=2, sticky="ew")
+        ttk.Label(file_toolbar, text="会话详情", style="Section.TLabel").pack(side=tk.LEFT)
+        ttk.Label(right, textvariable=self.selection_summary, style="Muted.TLabel").grid(
+            row=1, column=0, columnspan=2, sticky="w", pady=(5, 12)
+        )
+
+        file_columns = ("name", "duration", "size")
+        self.file_tree = ttk.Treeview(right, columns=file_columns, show="headings", selectmode="extended")
+        self.file_tree.heading("name", text="文件名")
+        self.file_tree.heading("duration", text="时长")
+        self.file_tree.heading("size", text="大小")
+        self.file_tree.column("name", width=260, minwidth=170, anchor=tk.W)
+        self.file_tree.column("duration", width=76, anchor=tk.CENTER, stretch=False)
+        self.file_tree.column("size", width=88, anchor=tk.E, stretch=False)
+        self.file_tree.grid(row=2, column=0, sticky="nsew")
+        file_scroll = ttk.Scrollbar(right, orient=tk.VERTICAL, command=self.file_tree.yview)
+        file_scroll.grid(row=2, column=1, sticky="ns")
+        self.file_tree.configure(yscrollcommand=file_scroll.set)
+
+        file_actions = ttk.Frame(right)
+        file_actions.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(12, 0))
+        ttk.Button(file_actions, text="从选中文件处拆分", command=self.split_group_at_file).pack(side=tk.LEFT)
+        ttk.Button(file_actions, text="从列表移除", command=self.remove_selected_files).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(
+            file_actions,
+            text="移到废纸篓",
+            command=self.delete_selected_files_from_disk,
+            style="Danger.TButton",
+        ).pack(side=tk.RIGHT)
+
+        export_panel = ttk.Frame(self.root, style="Panel.TFrame", padding=(18, 14))
+        export_panel.grid(row=3, column=0, sticky="ew", padx=18, pady=(0, 12))
         export_panel.columnconfigure(1, weight=1)
+        ttk.Label(export_panel, text="3  导出", style="Section.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 16))
+        ttk.Entry(export_panel, textvariable=self.output_folder, style="Path.TEntry").grid(row=0, column=1, sticky="ew")
+        ttk.Button(export_panel, text="选择目录", command=self.choose_output_folder).grid(row=0, column=2, padx=(8, 0))
+        ttk.Button(export_panel, text="打开目录", command=self.open_output_folder).grid(row=0, column=3, padx=(8, 18))
 
-        ttk.Label(export_panel, text="输出目录").grid(row=0, column=0, sticky="w")
-        ttk.Entry(export_panel, textvariable=self.output_folder).grid(row=0, column=1, sticky="ew", padx=8)
-        ttk.Button(export_panel, text="选择", command=self.choose_output_folder).grid(row=0, column=2)
-
-        ttk.Label(export_panel, text="格式").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        export_options = ttk.Frame(export_panel)
+        export_options.grid(row=1, column=1, columnspan=3, sticky="ew", pady=(10, 0))
+        ttk.Label(export_options, text="格式", style="Muted.TLabel").pack(side=tk.LEFT)
         self.format_combo = ttk.Combobox(
-            export_panel,
+            export_options,
             textvariable=self.format_label,
             values=[preset["label"] for preset in FORMAT_PRESETS.values()],
             state="readonly",
-            width=18,
+            width=17,
         )
-        self.format_combo.grid(row=1, column=1, sticky="w", padx=8, pady=(8, 0))
+        self.format_combo.pack(side=tk.LEFT, padx=(6, 14))
         self.format_combo.bind("<<ComboboxSelected>>", self.on_format_label_change)
+        self.bitrate_label = ttk.Label(export_options, text="码率", style="Muted.TLabel")
+        self.bitrate_label.pack(side=tk.LEFT)
+        self.bitrate_combo = ttk.Combobox(export_options, textvariable=self.bitrate, state="readonly", width=5)
+        self.bitrate_combo.pack(side=tk.LEFT, padx=(6, 4))
+        ttk.Label(export_options, text="kbps", style="Muted.TLabel").pack(side=tk.LEFT, padx=(0, 14))
+        ttk.Checkbutton(export_options, text="转为单声道", variable=self.mix_to_mono).pack(side=tk.LEFT)
+        ttk.Separator(export_options, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=14)
+        ttk.Radiobutton(
+            export_options,
+            text="全部会话",
+            variable=self.export_selected_only,
+            value=False,
+            command=self.update_button_states,
+        ).pack(side=tk.LEFT)
+        ttk.Radiobutton(
+            export_options,
+            text="仅选中会话",
+            variable=self.export_selected_only,
+            value=True,
+            command=self.update_button_states,
+        ).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Checkbutton(
+            export_panel,
+            text="导出成功后将源 WAV 移到废纸篓",
+            variable=self.delete_sources_after_export,
+        ).grid(row=2, column=1, columnspan=3, sticky="w", pady=(8, 0))
 
-        self.bitrate_label = ttk.Label(export_panel, text="码率")
-        self.bitrate_label.grid(row=2, column=0, sticky="w", pady=(8, 0))
-        self.bitrate_combo = ttk.Combobox(export_panel, textvariable=self.bitrate, state="readonly", width=8)
-        self.bitrate_combo.grid(row=2, column=1, sticky="w", padx=8, pady=(8, 0))
-        ttk.Checkbutton(export_panel, text="转单声道", variable=self.mix_to_mono).grid(
-            row=2, column=1, sticky="w", padx=(100, 0), pady=(8, 0)
+        self.export_button = ttk.Button(
+            export_panel,
+            textvariable=self.export_button_text,
+            command=self.start_export,
+            style="Primary.TButton",
         )
+        self.export_button.grid(row=0, column=4, rowspan=3, sticky="nsew", ipadx=10)
 
-        ttk.Checkbutton(export_panel, text="只导出选中会话", variable=self.export_selected_only).grid(
-            row=3, column=0, columnspan=2, sticky="w", pady=(8, 0)
-        )
-        ttk.Checkbutton(export_panel, text="导出成功后将源 WAV 移到废纸篓", variable=self.delete_sources_after_export).grid(
-            row=4, column=0, columnspan=3, sticky="w", pady=(8, 0)
-        )
-        self.export_button = ttk.Button(export_panel, text="开始批量导出", command=self.start_export)
-        self.export_button.grid(row=3, column=2, rowspan=2, sticky="e", pady=(8, 0))
-
-        file_toolbar = ttk.Frame(right)
-        file_toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 6))
-        ttk.Label(file_toolbar, text="会话内文件").pack(side=tk.LEFT)
-        ttk.Button(file_toolbar, text="删除源文件", command=self.delete_selected_files_from_disk).pack(side=tk.RIGHT, padx=(6, 0))
-        ttk.Button(file_toolbar, text="移除文件", command=self.remove_selected_files).pack(side=tk.RIGHT, padx=(6, 0))
-        ttk.Button(file_toolbar, text="从此拆分", command=self.split_group_at_file).pack(side=tk.RIGHT, padx=(6, 0))
-
-        file_columns = ("name", "start", "duration", "size")
-        self.file_tree = ttk.Treeview(right, columns=file_columns, show="headings", selectmode="extended")
-        self.file_tree.heading("name", text="文件名")
-        self.file_tree.heading("start", text="开始时间")
-        self.file_tree.heading("duration", text="时长")
-        self.file_tree.heading("size", text="大小")
-        self.file_tree.column("name", width=250, anchor=tk.W)
-        self.file_tree.column("start", width=142, anchor=tk.W, stretch=False)
-        self.file_tree.column("duration", width=82, anchor=tk.CENTER, stretch=False)
-        self.file_tree.column("size", width=86, anchor=tk.E, stretch=False)
-        self.file_tree.grid(row=1, column=0, sticky="nsew")
-
-        file_scroll = ttk.Scrollbar(right, orient=tk.VERTICAL, command=self.file_tree.yview)
-        file_scroll.grid(row=1, column=1, sticky="ns")
-        self.file_tree.configure(yscrollcommand=file_scroll.set)
-
-        info = ttk.Frame(right)
-        info.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
-        info.columnconfigure(0, weight=1)
-        ttk.Label(info, textvariable=self.status_text, wraplength=430).grid(row=0, column=0, sticky="ew")
-
-        bottom = ttk.Frame(self.root, padding=(12, 0, 12, 12))
-        bottom.grid(row=2, column=0, sticky="ew")
+        bottom = ttk.Frame(self.root, style="Status.TFrame", padding=(18, 8, 18, 12))
+        bottom.grid(row=4, column=0, sticky="ew")
         bottom.columnconfigure(0, weight=1)
-        ttk.Progressbar(bottom, variable=self.progress_value, maximum=100).grid(row=0, column=0, sticky="ew")
-        ttk.Label(bottom, textvariable=self.progress_text, width=28).grid(row=0, column=1, padx=(10, 0))
+        ttk.Label(bottom, textvariable=self.status_text, style="Status.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(bottom, textvariable=self.progress_text, style="Status.TLabel", width=12, anchor=tk.E).grid(
+            row=0, column=1, padx=(10, 0)
+        )
+        ttk.Progressbar(bottom, variable=self.progress_value, maximum=100).grid(
+            row=1, column=0, columnspan=2, sticky="ew", pady=(7, 0)
+        )
 
         self.format_label.set(FORMAT_PRESETS[self.format_choice.get()]["label"])
 
@@ -313,6 +459,23 @@ class WavMergerApp:
         if folder:
             self.output_folder.set(folder)
             self.save_config()
+
+    def open_output_folder(self) -> None:
+        raw_folder = self.output_folder.get().strip()
+        if not raw_folder:
+            messagebox.showinfo("提示", "请先选择输出目录。")
+            return
+        folder = Path(raw_folder).expanduser()
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            if sys.platform == "darwin":
+                subprocess.Popen(["open", str(folder)])
+            elif sys.platform.startswith("win"):
+                os.startfile(str(folder))  # type: ignore[attr-defined]
+            else:
+                subprocess.Popen(["xdg-open", str(folder)])
+        except OSError as exc:
+            messagebox.showerror("无法打开目录", str(exc))
 
     def add_files(self) -> None:
         initial = self.selected_folder.get() or str(Path.home())
@@ -469,23 +632,38 @@ class WavMergerApp:
                 tk.END,
                 iid=str(index),
                 values=(
-                    index + 1,
                     self.format_datetime(group.start_time),
                     len(group.files),
                     self.format_duration(group.duration),
                     self.format_size(group.size),
-                    self.output_name_for_group(group),
                 ),
+                tags=("even" if index % 2 == 0 else "odd",),
             )
+
+        self.group_tree.tag_configure("even", background="#ffffff")
+        self.group_tree.tag_configure("odd", background="#fafbfc")
 
         for index in selected_indices:
             if 0 <= index < len(self.groups):
                 self.group_tree.selection_add(str(index))
+        if self.groups and not self.group_tree.selection():
+            self.group_tree.selection_set("0")
+
+        total_duration = sum(group.duration for group in self.groups)
+        total_size = sum(group.size for group in self.groups)
+        if self.audio_files:
+            self.library_summary.set(
+                f"{len(self.audio_files)} 个 WAV  ·  {len(self.groups)} 个会话  ·  "
+                f"{self.format_duration(total_duration)}  ·  {self.format_size(total_size)}"
+            )
+        else:
+            self.library_summary.set("尚未导入录音")
 
     def refresh_file_tree(self) -> None:
         self.file_tree.delete(*self.file_tree.get_children())
         group = self.get_primary_selected_group()
         if not group:
+            self.selection_summary.set("选择左侧会话，查看其中的录音文件")
             return
         for index, audio_file in enumerate(group.files):
             self.file_tree.insert(
@@ -494,11 +672,16 @@ class WavMergerApp:
                 iid=str(index),
                 values=(
                     audio_file.display_name,
-                    self.format_datetime(audio_file.start_time),
                     self.format_duration(audio_file.duration),
                     self.format_size(audio_file.size),
                 ),
+                tags=("even" if index % 2 == 0 else "odd",),
             )
+        self.file_tree.tag_configure("even", background="#ffffff")
+        self.file_tree.tag_configure("odd", background="#fafbfc")
+        self.selection_summary.set(
+            f"{len(group.files)} 个分段  ·  {self.format_duration(group.duration)}  ·  {self.format_size(group.size)}"
+        )
 
     def on_group_select(self, _event: tk.Event) -> None:
         self.refresh_file_tree()
@@ -827,7 +1010,16 @@ class WavMergerApp:
     def update_button_states(self) -> None:
         has_files = bool(self.audio_files)
         has_groups = bool(self.groups)
-        self.export_button.configure(state=tk.DISABLED if self.is_exporting or not has_groups else tk.NORMAL)
+        export_count = len(self.get_groups_to_export()) if has_groups else 0
+        if self.is_exporting:
+            self.export_button_text.set("正在导出…")
+        elif self.export_selected_only.get():
+            self.export_button_text.set(f"导出选中的 {export_count} 个会话")
+        else:
+            self.export_button_text.set(f"导出全部 {export_count} 个会话")
+        self.export_button.configure(
+            state=tk.DISABLED if self.is_exporting or not has_groups or export_count == 0 else tk.NORMAL
+        )
         for widget in (self.group_tree, self.file_tree):
             widget.configure(selectmode="none" if self.is_exporting else "extended")
         if not has_files and not self.is_exporting:
