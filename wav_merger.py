@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import plistlib
 import queue
 import re
 import shutil
@@ -32,6 +33,8 @@ except ImportError:  # setup installs it for normal use.
 APP_TITLE = "DJI Mic 录音整理工具"
 CONFIG_PATH = Path.home() / ".wav_merger_config.json"
 SUPPORTED_EXTENSIONS = {".wav", ".wave"}
+DJI_FOLDER_PATTERN = re.compile(r"^TX_MIC\d{3}_\d{8}_\d{6}$", re.IGNORECASE)
+DJI_FILE_PATTERN = re.compile(r"^TX\d+_MIC\d+_\d{8}_\d{6}.*\.(?:wav|wave)$", re.IGNORECASE)
 
 
 FORMAT_PRESETS = {
@@ -97,6 +100,66 @@ class RecordingGroup:
         return sum(item.size for item in self.files)
 
 
+@dataclass(frozen=True)
+class DjiMicVolume:
+    mount_point: Path
+    device_identifier: str
+    volume_name: str
+    volume_uuid: str
+
+
+def path_is_within(path: Path, parent: Path) -> bool:
+    """Return whether path belongs to parent, including not-yet-created paths."""
+    try:
+        path.resolve(strict=False).relative_to(parent.resolve(strict=False))
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def dji_recording_layout_present(mount_point: Path) -> bool:
+    """Recognize the directory and filename layout written by DJI Mic transmitters."""
+    try:
+        for child in mount_point.iterdir():
+            if not child.is_dir() or not DJI_FOLDER_PATTERN.match(child.name):
+                continue
+            try:
+                if any(item.is_file() and DJI_FILE_PATTERN.match(item.name) for item in child.iterdir()):
+                    return True
+            except OSError:
+                continue
+    except OSError:
+        return False
+    return False
+
+
+def disk_info_is_dji_mic(info: dict, mount_point: Path) -> bool:
+    """Use both disk metadata and DJI's recording layout to avoid ejecting other disks."""
+    is_external = bool(
+        info.get("RemovableMediaOrExternalDevice")
+        or info.get("RemovableMedia")
+        or info.get("Removable")
+        or info.get("Ejectable")
+    ) and not bool(info.get("Internal") or info.get("OSInternalMedia"))
+    if not is_external:
+        return False
+
+    metadata = " ".join(
+        str(info.get(key, ""))
+        for key in (
+            "VolumeName",
+            "MediaName",
+            "IORegistryEntryName",
+            "DeviceVendor",
+            "DeviceModel",
+        )
+    ).casefold()
+    explicit_dji_name = bool(re.search(r"\bdji[\s_-]*mic\b", metadata))
+    transmitter_name = bool(re.search(r"\bwireles+s?\s+mic\s+tx\b|\bmic\s+tx\b", metadata))
+    has_layout = dji_recording_layout_present(mount_point)
+    return (explicit_dji_name and has_layout) or (transmitter_name and has_layout)
+
+
 class WavMergerApp:
     def __init__(self) -> None:
         self.root = tk.Tk()
@@ -127,6 +190,9 @@ class WavMergerApp:
         self.progress_value = tk.DoubleVar(value=0)
         self.work_queue: queue.Queue[tuple[str, object]] = queue.Queue()
         self.is_exporting = False
+        self.is_ejecting = False
+        self.pending_eject: DjiMicVolume | None = None
+        self.active_export_paths: list[Path] = []
         self.current_process: subprocess.Popen[str] | None = None
 
         self.build_ui()
@@ -283,6 +349,13 @@ class WavMergerApp:
             row=0, column=3, padx=(8, 0)
         )
         ttk.Button(source, text="添加 WAV", command=self.add_files).grid(row=0, column=4, padx=(8, 0))
+        self.eject_button = ttk.Button(
+            source,
+            text="弹出 DJI Mic",
+            command=self.request_dji_mic_eject,
+            style="Accent.TButton",
+        )
+        self.eject_button.grid(row=0, column=5, padx=(8, 0))
 
         source_options = ttk.Frame(source)
         source_options.grid(row=1, column=1, columnspan=4, sticky="w", pady=(10, 0))
@@ -476,6 +549,156 @@ class WavMergerApp:
                 subprocess.Popen(["xdg-open", str(folder)])
         except OSError as exc:
             messagebox.showerror("无法打开目录", str(exc))
+
+    def disk_info(self, target: Path | str) -> dict | None:
+        if sys.platform != "darwin":
+            return None
+        try:
+            result = subprocess.run(
+                ["diskutil", "info", "-plist", str(target)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=8,
+                check=False,
+            )
+            if result.returncode != 0:
+                return None
+            parsed = plistlib.loads(result.stdout)
+            return parsed if isinstance(parsed, dict) else None
+        except (OSError, subprocess.SubprocessError, plistlib.InvalidFileException):
+            return None
+
+    def volume_from_mount_point(self, mount_point: Path) -> DjiMicVolume | None:
+        info = self.disk_info(mount_point)
+        if not info or not disk_info_is_dji_mic(info, mount_point):
+            return None
+        identifier = str(info.get("ParentWholeDisk") or info.get("DeviceIdentifier") or "")
+        if not re.fullmatch(r"disk\d+(?:s\d+)*", identifier):
+            return None
+        return DjiMicVolume(
+            mount_point=mount_point,
+            device_identifier=identifier,
+            volume_name=str(info.get("VolumeName") or mount_point.name or "DJI Mic"),
+            volume_uuid=str(info.get("VolumeUUID") or ""),
+        )
+
+    def mounted_volume_for_path(self, path: Path) -> Path | None:
+        resolved = path.expanduser().resolve(strict=False)
+        volumes_root = Path("/Volumes")
+        try:
+            relative = resolved.relative_to(volumes_root)
+        except ValueError:
+            return None
+        return volumes_root / relative.parts[0] if relative.parts else None
+
+    def find_dji_mic_volumes(self) -> list[DjiMicVolume]:
+        mount_points: list[Path] = []
+        source_paths = [item.path for item in self.audio_files]
+        selected = self.selected_folder.get().strip()
+        if selected:
+            source_paths.insert(0, Path(selected))
+        for path in source_paths:
+            mount_point = self.mounted_volume_for_path(path)
+            if mount_point and mount_point not in mount_points:
+                mount_points.append(mount_point)
+
+        volumes: list[DjiMicVolume] = []
+        for mount_point in mount_points:
+            volume = self.volume_from_mount_point(mount_point)
+            if volume and volume.device_identifier not in {item.device_identifier for item in volumes}:
+                volumes.append(volume)
+
+        # If nothing in the current library is a DJI Mic, look for a connected
+        # transmitter. Multiple matches are deliberately not guessed.
+        if not volumes:
+            try:
+                mount_points = [path for path in Path("/Volumes").iterdir() if path.is_dir()]
+            except OSError:
+                mount_points = []
+            for mount_point in mount_points:
+                volume = self.volume_from_mount_point(mount_point)
+                if volume and volume.device_identifier not in {item.device_identifier for item in volumes}:
+                    volumes.append(volume)
+        return volumes
+
+    def request_dji_mic_eject(self) -> None:
+        if sys.platform != "darwin":
+            messagebox.showinfo("暂不支持", "一键弹出 DJI Mic 目前仅支持 macOS。")
+            return
+        if self.is_ejecting:
+            return
+
+        volumes = self.find_dji_mic_volumes()
+        if not volumes:
+            messagebox.showinfo(
+                "未找到 DJI Mic",
+                "没有找到可安全确认的 DJI Mic。请确认设备已连接，并先选择或扫描设备中的录音文件夹。",
+            )
+            return
+        if len(volumes) > 1:
+            messagebox.showwarning(
+                "发现多个 DJI Mic",
+                "当前有多个符合条件的设备。为避免弹错设备，请只保留一个设备连接后再试。",
+            )
+            return
+
+        volume = volumes[0]
+        export_uses_volume = self.is_exporting and any(
+            path_is_within(path, volume.mount_point) for path in self.active_export_paths
+        )
+        if export_uses_volume:
+            self.pending_eject = volume
+            self.status_text.set("正在从 DJI Mic 导出；导出完成后将自动弹出。")
+            messagebox.showinfo(
+                "导出后弹出",
+                "程序正在使用 DJI Mic 中的文件。导出完成后会自动弹出，并通知你何时可以安全断开。",
+            )
+            self.update_button_states()
+            return
+
+        self.begin_dji_mic_eject(volume)
+
+    def begin_dji_mic_eject(self, volume: DjiMicVolume) -> None:
+        self.pending_eject = None
+        self.is_ejecting = True
+        self.status_text.set(f"正在弹出 DJI Mic（{volume.volume_name}）...")
+        self.update_button_states()
+        threading.Thread(target=self.eject_worker, args=(volume,), daemon=True).start()
+
+    def eject_worker(self, volume: DjiMicVolume) -> None:
+        try:
+            # The recording files may have been moved to Trash after export, so
+            # re-check the captured disk identity rather than its file layout.
+            info = self.disk_info(volume.mount_point)
+            if not info:
+                raise RuntimeError("设备已断开，或无法读取设备信息。")
+            current_identifier = str(info.get("ParentWholeDisk") or info.get("DeviceIdentifier") or "")
+            current_uuid = str(info.get("VolumeUUID") or "")
+            still_external = bool(
+                info.get("RemovableMediaOrExternalDevice")
+                or info.get("RemovableMedia")
+                or info.get("Removable")
+                or info.get("Ejectable")
+            ) and not bool(info.get("Internal") or info.get("OSInternalMedia"))
+            if not still_external or current_identifier != volume.device_identifier:
+                raise RuntimeError("设备标识已发生变化，为避免弹错设备，已取消操作。")
+            if volume.volume_uuid and current_uuid != volume.volume_uuid:
+                raise RuntimeError("设备卷标识已发生变化，为避免弹错设备，已取消操作。")
+
+            result = subprocess.run(
+                ["diskutil", "eject", volume.device_identifier],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            if result.returncode != 0:
+                detail = (result.stderr or result.stdout).strip()
+                raise RuntimeError(detail or "macOS 未能弹出设备。")
+            self.work_queue.put(("eject_done", volume.volume_name))
+        except Exception as exc:
+            self.work_queue.put(("eject_error", str(exc)))
 
     def add_files(self) -> None:
         initial = self.selected_folder.get() or str(Path.home())
@@ -837,6 +1060,8 @@ class WavMergerApp:
         delete_sources = self.delete_sources_after_export.get()
         self.save_config()
         self.is_exporting = True
+        self.active_export_paths = [audio_file.path for group in groups for audio_file in group.files]
+        self.active_export_paths.append(output_folder)
         self.progress_value.set(0)
         self.progress_text.set("准备导出...")
         self.status_text.set("正在导出，请稍等。")
@@ -956,19 +1181,40 @@ class WavMergerApp:
                     if deleted_paths:
                         self.remove_paths_from_state(set(deleted_paths))
                     self.is_exporting = False
+                    self.active_export_paths = []
                     self.progress_value.set(100)
                     self.progress_text.set("完成")
                     self.update_button_states()
                     suffix = f"，并移除了 {len(deleted_paths)} 个源 WAV" if deleted_paths else ""
                     self.status_text.set(f"导出完成：{len(outputs)} 个文件{suffix}。")
-                    messagebox.showinfo("完成", f"已导出 {len(outputs)} 个文件{suffix}。")
+                    if self.pending_eject:
+                        self.begin_dji_mic_eject(self.pending_eject)
+                    else:
+                        messagebox.showinfo("完成", f"已导出 {len(outputs)} 个文件{suffix}。")
                 elif kind == "error":
                     self.is_exporting = False
+                    self.active_export_paths = []
+                    eject_was_pending = self.pending_eject is not None
+                    self.pending_eject = None
                     self.progress_value.set(0)
                     self.progress_text.set("失败")
                     self.update_button_states()
-                    self.status_text.set("导出失败。")
-                    messagebox.showerror("导出失败", str(payload))
+                    self.status_text.set("导出失败；DJI Mic 未弹出。" if eject_was_pending else "导出失败。")
+                    suffix = "\n\n由于导出未成功，DJI Mic 没有自动弹出。" if eject_was_pending else ""
+                    messagebox.showerror("导出失败", f"{payload}{suffix}")
+                elif kind == "eject_done":
+                    self.is_ejecting = False
+                    self.update_button_states()
+                    self.status_text.set("DJI Mic 已弹出，可以安全断开设备。")
+                    messagebox.showinfo("可以安全断开", f"DJI Mic（{payload}）已弹出，可以安全断开设备。")
+                elif kind == "eject_error":
+                    self.is_ejecting = False
+                    self.update_button_states()
+                    self.status_text.set("DJI Mic 弹出失败。")
+                    messagebox.showerror(
+                        "无法弹出 DJI Mic",
+                        f"{payload}\n\n请关闭可能正在使用设备文件的其他程序后重试。",
+                    )
         except queue.Empty:
             pass
         self.root.after(120, self.drain_work_queue)
@@ -1020,6 +1266,15 @@ class WavMergerApp:
         self.export_button.configure(
             state=tk.DISABLED if self.is_exporting or not has_groups or export_count == 0 else tk.NORMAL
         )
+        if self.pending_eject:
+            self.eject_button.configure(text="导出后弹出", state=tk.DISABLED)
+        elif self.is_ejecting:
+            self.eject_button.configure(text="正在弹出…", state=tk.DISABLED)
+        else:
+            self.eject_button.configure(
+                text="弹出 DJI Mic",
+                state=tk.NORMAL if sys.platform == "darwin" else tk.DISABLED,
+            )
         for widget in (self.group_tree, self.file_tree):
             widget.configure(selectmode="none" if self.is_exporting else "extended")
         if not has_files and not self.is_exporting:
