@@ -9,7 +9,7 @@
 - 可调整分组间隔，默认 2 分钟
 - 可手动合并会话、从某个文件拆分会话、移除误选文件
 - 可将选中文件或选中会话的源 WAV 移到废纸篓/回收站
-- 批量导出，每个会话生成一个文件
+- 默认仅导出选中的会话，也可手动切换为全部会话；每个会话生成一个文件
 - 可选择导出成功后自动移除源 WAV
 - macOS 可一键弹出 DJI Mic；导出占用设备时会在导出结束后自动弹出
 - 默认推荐 M4A/AAC，适合人声录音压缩
@@ -17,10 +17,25 @@
 
 ## 使用
 
+### 直接下载应用（推荐）
+
+从 [GitHub Releases](https://github.com/songquanxu/wav-merger/releases/latest) 下载对应系统的压缩包，无需安装 Python 或 ffmpeg：
+
+- macOS：下载 `DJI-Mic-Organizer-macOS.zip`（Apple 芯片），解压后打开 `DJI Mic Organizer.app`，也可将其拖入“应用程序”。Intel Mac 可使用下方的源码运行方式。
+- Windows：下载 `DJI-Mic-Organizer-Windows.zip`，完整解压文件夹后运行其中的 `DJI Mic Organizer.exe`。
+- Linux：下载 `DJI-Mic-Organizer-Linux.tar.gz`，解压后运行文件夹中的 `DJI Mic Organizer`（需要图形桌面环境）。
+
+应用尚未进行开发者签名；macOS 若提示无法验证开发者，可在“系统设置 → 隐私与安全性”中允许打开你从本仓库下载的应用。
+
+选择录音文件夹并扫描，在左侧选中需要导出的会话（可多选），设置输出目录后点击导出。每次启动默认选择“仅选中会话”；需要批量处理全部录音时，请手动切换为“全部会话”。未选中任何会话时，默认模式下导出按钮不可用。
+
+### 从源码运行
+
 首次运行：
 
 ```bash
-cd /Users/songquan/Codes/wav-merger
+git clone https://github.com/songquanxu/wav-merger.git
+cd wav-merger
 ./setup.sh
 ./run_wav_merger.sh
 ```
@@ -28,7 +43,7 @@ cd /Users/songquan/Codes/wav-merger
 之后运行：
 
 ```bash
-cd /Users/songquan/Codes/wav-merger
+cd wav-merger
 ./run_wav_merger.sh
 ```
 

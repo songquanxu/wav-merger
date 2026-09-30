@@ -180,7 +180,7 @@ class WavMergerApp:
         self.bitrate = tk.StringVar(value=self.config.get("bitrate", "64"))
         self.mix_to_mono = tk.BooleanVar(value=self.config.get("mix_to_mono", True))
         self.recursive_scan = tk.BooleanVar(value=self.config.get("recursive_scan", True))
-        self.export_selected_only = tk.BooleanVar(value=False)
+        self.export_selected_only = tk.BooleanVar(value=True)
         self.delete_sources_after_export = tk.BooleanVar(value=self.config.get("delete_sources_after_export", False))
         self.status_text = tk.StringVar(value="请选择 DJI Mic 录音文件夹。")
         self.library_summary = tk.StringVar(value="尚未导入录音")
